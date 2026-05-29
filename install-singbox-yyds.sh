@@ -216,6 +216,79 @@ select_ss_method() {
 select_ss_method
 
 # -----------------------
+# 选择部署模式与中转设置
+select_install_mode() {
+    INSTALL_MODE="direct"
+    UPSTREAM_SS_SERVER=""
+    UPSTREAM_SS_PORT=""
+    UPSTREAM_SS_METHOD=""
+    UPSTREAM_SS_PASSWORD=""
+    RELAY_VLESS_TAGS=""
+
+    echo ""
+    echo "请选择部署模式:"
+    echo "1) 直连落地（默认）"
+    echo "2) 通过上游 Shadowsocks 中转指定 VLESS"
+    read -r install_mode_choice
+
+    case "${install_mode_choice:-1}" in
+        2)
+            INSTALL_MODE="relay_ss"
+            echo ""
+            echo "请输入上游 SS 服务器地址:"
+            read -r UPSTREAM_SS_SERVER
+            UPSTREAM_SS_SERVER="$(echo "$UPSTREAM_SS_SERVER" | tr -d '[:space:]')"
+
+            while [ -z "$UPSTREAM_SS_SERVER" ]; do
+                warn "上游 SS 服务器地址不能为空"
+                read -r UPSTREAM_SS_SERVER
+                UPSTREAM_SS_SERVER="$(echo "$UPSTREAM_SS_SERVER" | tr -d '[:space:]')"
+            done
+
+            echo "请输入上游 SS 端口:"
+            read -r UPSTREAM_SS_PORT
+            UPSTREAM_SS_PORT="$(echo "$UPSTREAM_SS_PORT" | tr -d '[:space:]')"
+            while ! echo "$UPSTREAM_SS_PORT" | grep -Eq '^[0-9]+$'; do
+                warn "上游 SS 端口必须是数字"
+                read -r UPSTREAM_SS_PORT
+                UPSTREAM_SS_PORT="$(echo "$UPSTREAM_SS_PORT" | tr -d '[:space:]')"
+            done
+
+            if $ENABLE_SS; then
+                echo "请输入上游 SS 加密方式(留空默认使用本机 SS 加密方式: $SS_METHOD):"
+                read -r UPSTREAM_SS_METHOD
+                UPSTREAM_SS_METHOD="$(echo "${UPSTREAM_SS_METHOD:-$SS_METHOD}" | tr -d '[:space:]')"
+            else
+                echo "请输入上游 SS 加密方式(默认 2022-blake3-aes-128-gcm):"
+                read -r UPSTREAM_SS_METHOD
+                UPSTREAM_SS_METHOD="$(echo "${UPSTREAM_SS_METHOD:-2022-blake3-aes-128-gcm}" | tr -d '[:space:]')"
+            fi
+
+            echo "请输入上游 SS 密码:"
+            read -r UPSTREAM_SS_PASSWORD
+            while [ -z "$UPSTREAM_SS_PASSWORD" ]; do
+                warn "上游 SS 密码不能为空"
+                read -r UPSTREAM_SS_PASSWORD
+            done
+
+            if $ENABLE_REALITY; then
+                RELAY_VLESS_TAGS="vless-in-1"
+                info "首次安装默认将 vless-in-1 设置为走上游 SS 中转"
+            else
+                warn "当前未启用 VLESS Reality，暂不绑定任何中转节点"
+            fi
+            ;;
+        *)
+            INSTALL_MODE="direct"
+            ;;
+    esac
+
+    export INSTALL_MODE UPSTREAM_SS_SERVER UPSTREAM_SS_PORT UPSTREAM_SS_METHOD UPSTREAM_SS_PASSWORD RELAY_VLESS_TAGS
+}
+
+select_install_mode
+
+# -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
 echo ""
 echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
@@ -646,14 +719,60 @@ CONFIG_HEAD
     
     cat "$TEMP_INBOUNDS" >> "$CONFIG_PATH"
     
-    cat >> "$CONFIG_PATH" <<'CONFIG_TAIL'
+    cat >> "$CONFIG_PATH" <<CONFIG_TAIL
   ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct-out"
+    }$(
+      if [ "${INSTALL_MODE:-direct}" = "relay_ss" ] && [ -n "${UPSTREAM_SS_SERVER:-}" ] && [ -n "${UPSTREAM_SS_PORT:-}" ] && [ -n "${UPSTREAM_SS_METHOD:-}" ] && [ -n "${UPSTREAM_SS_PASSWORD:-}" ]; then
+        cat <<EOF
+,
+    {
+      "type": "shadowsocks",
+      "tag": "ss-upstream",
+      "server": "${UPSTREAM_SS_SERVER}",
+      "server_port": ${UPSTREAM_SS_PORT},
+      "method": "${UPSTREAM_SS_METHOD}",
+      "password": "${UPSTREAM_SS_PASSWORD}"
     }
-  ]
+EOF
+      fi
+    )
+  ],
+  "route": $(
+    if [ "${INSTALL_MODE:-direct}" = "relay_ss" ] && [ -n "${RELAY_VLESS_TAGS:-}" ]; then
+      RELAY_JSON=$(printf '%s' "$RELAY_VLESS_TAGS" | awk -F',' '{
+        printf "[";
+        for (i=1; i<=NF; i++) {
+          gsub(/^ +| +$/, "", $i);
+          if ($i != "") {
+            if (c++) printf ", ";
+            printf "\"%s\"", $i;
+          }
+        }
+        printf "]";
+      }')
+      cat <<EOF
+{
+    "rules": [
+      {
+        "inbound": ${RELAY_JSON},
+        "outbound": "ss-upstream"
+      }
+    ],
+    "final": "direct-out"
+  }
+EOF
+    else
+      cat <<EOF
+{
+    "final": "direct-out"
+  }
+EOF
+    fi
+  )
 }
 CONFIG_TAIL
 
@@ -704,8 +823,13 @@ ANYTLS_USER=$ANYTLS_USER
 ANYTLS_PSK=$ANYTLS_PSK
 CACHEEOF
 
-    # 全局写入 CUSTOM_IP（哪怕为空也写）
     echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
+    echo "INSTALL_MODE=${INSTALL_MODE:-direct}" >> /etc/sing-box/.config_cache
+    echo "UPSTREAM_SS_SERVER=${UPSTREAM_SS_SERVER:-}" >> /etc/sing-box/.config_cache
+    echo "UPSTREAM_SS_PORT=${UPSTREAM_SS_PORT:-}" >> /etc/sing-box/.config_cache
+    echo "UPSTREAM_SS_METHOD=${UPSTREAM_SS_METHOD:-}" >> /etc/sing-box/.config_cache
+    echo "UPSTREAM_SS_PASSWORD=${UPSTREAM_SS_PASSWORD:-}" >> /etc/sing-box/.config_cache
+    echo "RELAY_VLESS_TAGS=${RELAY_VLESS_TAGS:-}" >> /etc/sing-box/.config_cache
 
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
 }
@@ -946,6 +1070,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
+PROTOCOL_FILE="/etc/sing-box/.protocols"
 SERVICE_NAME="sing-box"
 REALITY_PUB_FILE="/etc/sing-box/.reality_pub"
 URI_FILE="/etc/sing-box/uris.txt"
@@ -979,20 +1104,13 @@ detect_os() {
 
 detect_os
 
-service_start() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"
-}
-service_stop() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"
-}
-service_restart() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"
-}
-service_status() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
-}
+service_start() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"; }
+service_stop() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"; }
+service_restart() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"; }
+service_status() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager; }
 
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
+rand_pass() { openssl rand -base64 16 2>/dev/null | tr -d '\n\r' || head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r'; }
 rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
 rand_sid() { openssl rand -hex 4 2>/dev/null || echo "01234567"; }
 
@@ -1007,6 +1125,63 @@ need_config() {
     fi
 }
 
+load_protocol_flags() {
+    ENABLE_SS=false
+    ENABLE_HY2=false
+    ENABLE_TUIC=false
+    ENABLE_REALITY=false
+    ENABLE_ANYTLS=false
+    INSTALL_MODE="direct"
+    UPSTREAM_SS_SERVER=""
+    UPSTREAM_SS_PORT=""
+    UPSTREAM_SS_METHOD=""
+    UPSTREAM_SS_PASSWORD=""
+    RELAY_VLESS_TAGS=""
+    [ -f "$PROTOCOL_FILE" ] && . "$PROTOCOL_FILE"
+}
+
+save_protocol_flags() {
+    mkdir -p /etc/sing-box
+    cat > "$PROTOCOL_FILE" <<EOF
+ENABLE_SS=${ENABLE_SS:-false}
+ENABLE_HY2=${ENABLE_HY2:-false}
+ENABLE_TUIC=${ENABLE_TUIC:-false}
+ENABLE_REALITY=${ENABLE_REALITY:-false}
+ENABLE_ANYTLS=${ENABLE_ANYTLS:-false}
+EOF
+}
+
+set_protocol_flag() {
+    local key="$1" val="$2"
+    load_protocol_flags
+    case "$key" in
+        ENABLE_SS) ENABLE_SS="$val" ;;
+        ENABLE_HY2) ENABLE_HY2="$val" ;;
+        ENABLE_TUIC) ENABLE_TUIC="$val" ;;
+        ENABLE_REALITY) ENABLE_REALITY="$val" ;;
+        ENABLE_ANYTLS) ENABLE_ANYTLS="$val" ;;
+        *) err "未知协议标志: $key"; return 1 ;;
+    esac
+    save_protocol_flags
+}
+
+backup_config() { cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"; }
+rollback_config() { [ -f "${CONFIG_PATH}.bak" ] && mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; }
+
+validate_and_restart() {
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+            rollback_config
+            err "配置校验失败，已回滚"
+            return 1
+        fi
+    fi
+    service_restart || warn "服务重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+    return 0
+}
+
 migrate_legacy_reality_config() {
     need_config || return 1
 
@@ -1017,29 +1192,23 @@ migrate_legacy_reality_config() {
     if [ "$has_legacy" -gt 0 ] && [ "$has_new" -eq 0 ]; then
         info "检测到旧版 VLESS Reality 配置，正在迁移..."
         cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.migrate.$(date +%s)"
-
-        jq '
-        .inbounds |= map(
-          if .type=="vless" and .tag=="vless-in" and .tls.reality.enabled==true
-          then .tag="vless-in-1"
-          else .
-          end
-        )
-        ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
+        jq '.inbounds |= map(if .type=="vless" and .tag=="vless-in" and .tls.reality.enabled==true then .tag="vless-in-1" else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
         info "旧版 Reality 配置已迁移为 vless-in-1"
     fi
 }
 
 read_config() {
     need_config || return 1
-
-    PROTOCOL_FILE="/etc/sing-box/.protocols"
-    [ -f "$PROTOCOL_FILE" ] && . "$PROTOCOL_FILE"
+    load_protocol_flags
     [ -f "$CACHE_FILE" ] && . "$CACHE_FILE"
 
+    INSTALL_MODE="${INSTALL_MODE:-direct}"
+    UPSTREAM_SS_SERVER="${UPSTREAM_SS_SERVER:-}"
+    UPSTREAM_SS_PORT="${UPSTREAM_SS_PORT:-}"
+    UPSTREAM_SS_METHOD="${UPSTREAM_SS_METHOD:-}"
+    UPSTREAM_SS_PASSWORD="${UPSTREAM_SS_PASSWORD:-}"
+    RELAY_VLESS_TAGS="${RELAY_VLESS_TAGS:-}"
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
-    ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
     CUSTOM_IP="${CUSTOM_IP:-}"
 
     if [ "${ENABLE_SS:-false}" = "true" ]; then
@@ -1067,8 +1236,12 @@ read_config() {
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
         REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
         REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
     fi
+
+    REALITY_PK=$(jq -r '.inbounds[] | select((.type=="vless" or .type=="anytls") and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_SNI=$(jq -r '.inbounds[] | select((.type=="vless" or .type=="anytls") and .tls.enabled==true) | .tls.server_name // empty' "$CONFIG_PATH" | head -n1 || true)
+    REALITY_SID=$(jq -r '.inbounds[] | select((.type=="vless" or .type=="anytls") and .tls.reality.enabled==true) | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1 || true)
+    REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
 
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
         ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
@@ -1110,13 +1283,7 @@ get_public_ip() {
 
 generate_uris() {
     read_config || return 1
-
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        PUBLIC_IP="$CUSTOM_IP"
-    else
-        PUBLIC_IP=$(get_public_ip)
-    fi
-
+    if [ -n "${CUSTOM_IP:-}" ]; then PUBLIC_IP="$CUSTOM_IP"; else PUBLIC_IP=$(get_public_ip); fi
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     : > "$URI_FILE"
 
@@ -1163,6 +1330,52 @@ generate_uris() {
     fi
 }
 
+jq_add_inbound() {
+    local inbound_json="$1"
+    jq --argjson inbound "$inbound_json" '.inbounds += [$inbound]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+}
+
+jq_remove_by_tag() {
+    local tag="$1"
+    jq --arg tag "$tag" '.inbounds |= map(select(.tag != $tag))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+}
+
+relay_tags_to_json() {
+    local tags_csv="$1"
+    printf '%s' "$tags_csv" | awk -F',' '{
+        printf "[";
+        for (i=1; i<=NF; i++) {
+            gsub(/^ +| +$/, "", $i);
+            if ($i != "") {
+                if (c++) printf ", ";
+                printf "\"%s\"", $i;
+            }
+        }
+        printf "]";
+    }'
+}
+
+apply_relay_settings() {
+    read_config || return 1
+    backup_config
+
+    jq 'del(.outbounds[]? | select(.tag == "ss-upstream"))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    if [ "${INSTALL_MODE:-direct}" = "relay_ss" ] && [ -n "${UPSTREAM_SS_SERVER:-}" ] && [ -n "${UPSTREAM_SS_PORT:-}" ] && [ -n "${UPSTREAM_SS_METHOD:-}" ] && [ -n "${UPSTREAM_SS_PASSWORD:-}" ]; then
+        relay_outbound=$(jq -nc --arg server "$UPSTREAM_SS_SERVER" --argjson port "$UPSTREAM_SS_PORT" --arg method "$UPSTREAM_SS_METHOD" --arg password "$UPSTREAM_SS_PASSWORD" '{type:"shadowsocks",tag:"ss-upstream",server:$server,server_port:$port,method:$method,password:$password}')
+        jq --argjson outbound "$relay_outbound" '.outbounds += [$outbound]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    fi
+
+    if [ "${INSTALL_MODE:-direct}" = "relay_ss" ] && [ -n "${RELAY_VLESS_TAGS:-}" ] && [ -n "${UPSTREAM_SS_SERVER:-}" ] && [ -n "${UPSTREAM_SS_PORT:-}" ] && [ -n "${UPSTREAM_SS_METHOD:-}" ] && [ -n "${UPSTREAM_SS_PASSWORD:-}" ]; then
+        relay_json=$(relay_tags_to_json "$RELAY_VLESS_TAGS")
+        jq --argjson inbound_list "$relay_json" '.route = {rules: [{inbound: $inbound_list, outbound: "ss-upstream"}], final: "direct-out"}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    else
+        jq '.route = {final: "direct-out"}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    fi
+
+    validate_and_restart
+}
+
 action_view_uri() { info "正在生成并显示 URI..."; generate_uris || { err "生成 URI 失败"; return 1; }; echo; cat "$URI_FILE"; }
 action_view_config() { echo "$CONFIG_PATH"; }
 
@@ -1186,11 +1399,36 @@ action_reset_ss() {
     [ "${ENABLE_SS:-false}" = "true" ] || { err "SS 协议未启用"; return 1; }
     read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
     new_port="${new_port:-$SS_PORT}"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    backup_config
     jq --argjson port "$new_port" '.inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    service_restart || warn "重启失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    validate_and_restart
+}
+
+action_add_ss() {
+    read_config || return 1
+    [ "${ENABLE_SS:-false}" != "true" ] || { warn "SS 已存在"; return 0; }
+    read -p "输入 SS 端口(留空随机 10000-60000): " new_port
+    read -p "输入 SS 加密方式(默认 2022-blake3-aes-128-gcm): " new_method
+    read -p "输入 SS 密码(留空自动生成): " new_psk
+    new_port="${new_port:-$(rand_port)}"
+    new_method="${new_method:-2022-blake3-aes-128-gcm}"
+    new_psk="${new_psk:-$(rand_pass)}"
+    inbound=$(jq -nc --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:"ss-in"}')
+    backup_config
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_SS true
+    validate_and_restart
+}
+
+action_delete_ss() {
+    read_config || return 1
+    [ "${ENABLE_SS:-false}" = "true" ] || { warn "SS 未启用"; return 0; }
+    read -p "确认删除 SS 协议? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    backup_config
+    jq_remove_by_tag "ss-in"
+    set_protocol_flag ENABLE_SS false
+    validate_and_restart
 }
 
 action_reset_hy2() {
@@ -1198,11 +1436,34 @@ action_reset_hy2() {
     [ "${ENABLE_HY2:-false}" = "true" ] || { err "HY2 协议未启用"; return 1; }
     read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
     new_port="${new_port:-$HY2_PORT}"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    backup_config
     jq --argjson port "$new_port" '.inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    service_restart || warn "重启失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    validate_and_restart
+}
+
+action_add_hy2() {
+    read_config || return 1
+    [ "${ENABLE_HY2:-false}" != "true" ] || { warn "HY2 已存在"; return 0; }
+    read -p "输入 HY2 端口(留空随机 10000-60000): " new_port
+    read -p "输入 HY2 密码(留空自动生成): " new_psk
+    new_port="${new_port:-$(rand_port)}"
+    new_psk="${new_psk:-$(rand_pass)}"
+    inbound=$(jq -nc --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    backup_config
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_HY2 true
+    validate_and_restart
+}
+
+action_delete_hy2() {
+    read_config || return 1
+    [ "${ENABLE_HY2:-false}" = "true" ] || { warn "HY2 未启用"; return 0; }
+    read -p "确认删除 HY2 协议? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    backup_config
+    jq_remove_by_tag "hy2-in"
+    set_protocol_flag ENABLE_HY2 false
+    validate_and_restart
 }
 
 action_reset_tuic() {
@@ -1210,11 +1471,36 @@ action_reset_tuic() {
     [ "${ENABLE_TUIC:-false}" = "true" ] || { err "TUIC 协议未启用"; return 1; }
     read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
     new_port="${new_port:-$TUIC_PORT}"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    backup_config
     jq --argjson port "$new_port" '.inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    service_restart || warn "重启失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    validate_and_restart
+}
+
+action_add_tuic() {
+    read_config || return 1
+    [ "${ENABLE_TUIC:-false}" != "true" ] || { warn "TUIC 已存在"; return 0; }
+    read -p "输入 TUIC 端口(留空随机 10000-60000): " new_port
+    read -p "输入 TUIC UUID(留空自动生成): " new_uuid
+    read -p "输入 TUIC 密码(留空自动生成): " new_psk
+    new_port="${new_port:-$(rand_port)}"
+    new_uuid="${new_uuid:-$(rand_uuid)}"
+    new_psk="${new_psk:-$(rand_pass)}"
+    inbound=$(jq -nc --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    backup_config
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_TUIC true
+    validate_and_restart
+}
+
+action_delete_tuic() {
+    read_config || return 1
+    [ "${ENABLE_TUIC:-false}" = "true" ] || { warn "TUIC 未启用"; return 0; }
+    read -p "确认删除 TUIC 协议? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    backup_config
+    jq_remove_by_tag "tuic-in"
+    set_protocol_flag ENABLE_TUIC false
+    validate_and_restart
 }
 
 action_list_reality() {
@@ -1238,13 +1524,11 @@ action_add_reality() {
     new_tag="vless-in-$next_index"
     new_uuid="$(rand_uuid)"
     new_sid="$(rand_sid)"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    jq --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sid "$new_sid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" '
-      .inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$port,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
-    service_restart || warn "服务重启失败"
-    generate_uris || warn "生成 URI 失败"
+    backup_config
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sid "$new_sid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" '{type:"vless",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_REALITY true
+    validate_and_restart
     info "已新增 ${new_tag}"
 }
 
@@ -1262,11 +1546,12 @@ action_delete_reality() {
     target_tag="${REALITY_TAGS[$idx]}"
     read -p "确认删除 ${target_tag} ? [y/N]: " confirm
     case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    jq --arg tag "$target_tag" '.inbounds |= map(select(.tag != $tag))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
-    service_restart || warn "服务重启失败"
-    generate_uris || warn "生成 URI 失败"
+    backup_config
+    jq_remove_by_tag "$target_tag"
+    local remaining
+    remaining=$(jq -r '[.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true)] | length' "$CONFIG_PATH")
+    [ "$remaining" -gt 0 ] || set_protocol_flag ENABLE_REALITY false
+    validate_and_restart
     info "已删除 ${target_tag}"
 }
 
@@ -1285,12 +1570,9 @@ action_reset_reality() {
     current_port="${REALITY_PORTS[$idx]}"
     read -p "输入新的端口(回车保持 $current_port): " new_port
     new_port="${new_port:-$current_port}"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag == $tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
-    service_restart || warn "重启失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    validate_and_restart
 }
 
 action_reset_anytls() {
@@ -1298,11 +1580,39 @@ action_reset_anytls() {
     [ "${ENABLE_ANYTLS:-false}" = "true" ] || { err "AnyTLS Reality 协议未启用"; return 1; }
     read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
     new_port="${new_port:-$ANYTLS_PORT}"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    backup_config
     jq --argjson port "$new_port" '.inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    service_restart || warn "重启失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    validate_and_restart
+}
+
+action_add_anytls() {
+    read_config || return 1
+    [ "${ENABLE_ANYTLS:-false}" != "true" ] || { warn "AnyTLS 已存在"; return 0; }
+    read -p "输入 AnyTLS 端口(留空随机 10000-60000): " new_port
+    read -p "输入 AnyTLS 用户名(默认 anytls): " new_user
+    read -p "输入 AnyTLS 密码(留空自动生成): " new_psk
+    new_port="${new_port:-$(rand_port)}"
+    new_user="${new_user:-anytls}"
+    new_psk="${new_psk:-$(rand_pass)}"
+    REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+    REALITY_SID="${REALITY_SID:-$(rand_sid)}"
+    [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增 AnyTLS"; return 1; }
+    backup_config
+    inbound=$(jq -nc --argjson port "$new_port" --arg user "$new_user" --arg psk "$new_psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_ANYTLS true
+    validate_and_restart
+}
+
+action_delete_anytls() {
+    read_config || return 1
+    [ "${ENABLE_ANYTLS:-false}" = "true" ] || { warn "AnyTLS 未启用"; return 0; }
+    read -p "确认删除 AnyTLS 协议? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    backup_config
+    jq_remove_by_tag "anytls-in"
+    set_protocol_flag ENABLE_ANYTLS false
+    validate_and_restart
 }
 
 action_update() {
@@ -1310,6 +1620,158 @@ action_update() {
     if [ "$OS" = "alpine" ]; then apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh); else bash <(curl -fsSL https://sing-box.app/install.sh); fi
     info "更新完成,已重启服务..."
     if command -v sing-box >/dev/null 2>&1; then NEW_VER=$(sing-box version 2>/dev/null | head -n1); info "当前版本: $NEW_VER"; service_restart || warn "重启失败"; fi
+}
+
+action_show_relay_status() {
+    read_config || return 1
+    echo
+    echo "当前部署模式: ${INSTALL_MODE:-direct}"
+    if [ "${INSTALL_MODE:-direct}" = "relay_ss" ]; then
+        echo "上游 SS 地址: ${UPSTREAM_SS_SERVER:-未设置}"
+        echo "上游 SS 端口: ${UPSTREAM_SS_PORT:-未设置}"
+        echo "上游 SS 加密: ${UPSTREAM_SS_METHOD:-未设置}"
+        echo "中转 VLESS 标签: ${RELAY_VLESS_TAGS:-未设置}"
+    else
+        echo "当前为直连模式，没有启用上游 SS 中转"
+    fi
+    echo
+}
+
+action_configure_relay_upstream() {
+    read_config || return 1
+    echo ""
+    echo "请输入上游 SS 服务器地址(当前: ${UPSTREAM_SS_SERVER:-未设置}):"
+    read -r new_server
+    new_server="${new_server:-${UPSTREAM_SS_SERVER:-}}"
+    new_server="$(echo "$new_server" | tr -d '[:space:]')"
+    [ -n "$new_server" ] || { err "上游 SS 地址不能为空"; return 1; }
+
+    echo "请输入上游 SS 端口(当前: ${UPSTREAM_SS_PORT:-未设置}):"
+    read -r new_port
+    new_port="${new_port:-${UPSTREAM_SS_PORT:-}}"
+    new_port="$(echo "$new_port" | tr -d '[:space:]')"
+    echo "$new_port" | grep -Eq '^[0-9]+$' || { err "上游 SS 端口必须是数字"; return 1; }
+
+    echo "请输入上游 SS 加密方式(当前: ${UPSTREAM_SS_METHOD:-未设置}):"
+    read -r new_method
+    new_method="${new_method:-${UPSTREAM_SS_METHOD:-}}"
+    new_method="$(echo "$new_method" | tr -d '[:space:]')"
+    [ -n "$new_method" ] || { err "上游 SS 加密方式不能为空"; return 1; }
+
+    echo "请输入上游 SS 密码(留空保持当前):"
+    read -r new_password
+    new_password="${new_password:-${UPSTREAM_SS_PASSWORD:-}}"
+    [ -n "$new_password" ] || { err "上游 SS 密码不能为空"; return 1; }
+
+    if [ ! -f "$CACHE_FILE" ]; then
+        touch "$CACHE_FILE"
+    fi
+    awk -F= '!/^(INSTALL_MODE|UPSTREAM_SS_SERVER|UPSTREAM_SS_PORT|UPSTREAM_SS_METHOD|UPSTREAM_SS_PASSWORD|RELAY_VLESS_TAGS)=/' "$CACHE_FILE" > "${CACHE_FILE}.tmp" || true
+    {
+        cat "${CACHE_FILE}.tmp" 2>/dev/null || true
+        echo "INSTALL_MODE=relay_ss"
+        echo "UPSTREAM_SS_SERVER=$new_server"
+        echo "UPSTREAM_SS_PORT=$new_port"
+        echo "UPSTREAM_SS_METHOD=$new_method"
+        echo "UPSTREAM_SS_PASSWORD=$new_password"
+        echo "RELAY_VLESS_TAGS=${RELAY_VLESS_TAGS:-}"
+    } > "$CACHE_FILE"
+    rm -f "${CACHE_FILE}.tmp"
+
+    INSTALL_MODE="relay_ss"
+    UPSTREAM_SS_SERVER="$new_server"
+    UPSTREAM_SS_PORT="$new_port"
+    UPSTREAM_SS_METHOD="$new_method"
+    UPSTREAM_SS_PASSWORD="$new_password"
+
+    apply_relay_settings || return 1
+    info "上游 SS 参数已更新并生效"
+}
+
+action_select_relay_vless_tags() {
+    read_reality_list || return 1
+    if [ "$REALITY_COUNT" -eq 0 ]; then
+        warn "当前没有可用于中转的 VLESS Reality 节点"
+        return 0
+    fi
+
+    echo
+    echo "请选择要走上游 SS 中转的 VLESS 节点，可多选，例如: 1 3"
+    for ((i=0; i<REALITY_COUNT; i++)); do
+        echo "$((i+1))) ${REALITY_TAGS[$i]} | port: ${REALITY_PORTS[$i]}"
+    done
+    echo "0) 清空中转绑定"
+    echo
+    read -r relay_choice
+
+    if [ "$relay_choice" = "0" ]; then
+        new_tags=""
+    else
+        new_tags=""
+        for n in $relay_choice; do
+            echo "$n" | grep -Eq '^[0-9]+$' || { err "输入包含非法编号"; return 1; }
+            idx=$((n - 1))
+            [ "$idx" -ge 0 ] && [ "$idx" -lt "$REALITY_COUNT" ] || { err "编号超出范围: $n"; return 1; }
+            tag="${REALITY_TAGS[$idx]}"
+            if [ -z "$new_tags" ]; then
+                new_tags="$tag"
+            else
+                case ",$new_tags," in
+                    *",$tag,"*) ;;
+                    *) new_tags="$new_tags,$tag" ;;
+                esac
+            fi
+        done
+    fi
+
+    if [ ! -f "$CACHE_FILE" ]; then
+        touch "$CACHE_FILE"
+    fi
+    awk -F= '!/^(INSTALL_MODE|RELAY_VLESS_TAGS|UPSTREAM_SS_SERVER|UPSTREAM_SS_PORT|UPSTREAM_SS_METHOD|UPSTREAM_SS_PASSWORD)=/' "$CACHE_FILE" > "${CACHE_FILE}.tmp" || true
+    {
+        cat "${CACHE_FILE}.tmp" 2>/dev/null || true
+        echo "INSTALL_MODE=relay_ss"
+        echo "RELAY_VLESS_TAGS=$new_tags"
+        echo "UPSTREAM_SS_SERVER=${UPSTREAM_SS_SERVER:-}"
+        echo "UPSTREAM_SS_PORT=${UPSTREAM_SS_PORT:-}"
+        echo "UPSTREAM_SS_METHOD=${UPSTREAM_SS_METHOD:-}"
+        echo "UPSTREAM_SS_PASSWORD=${UPSTREAM_SS_PASSWORD:-}"
+    } > "$CACHE_FILE"
+    rm -f "${CACHE_FILE}.tmp"
+
+    INSTALL_MODE="relay_ss"
+    RELAY_VLESS_TAGS="$new_tags"
+
+    apply_relay_settings || return 1
+    info "已更新中转 VLESS 标签并生效: ${new_tags:-<空>}"
+}
+
+action_disable_relay_mode() {
+    if [ ! -f "$CACHE_FILE" ]; then
+        warn "未找到缓存文件，当前无需关闭中转"
+        return 0
+    fi
+    awk -F= '!/^(INSTALL_MODE|UPSTREAM_SS_SERVER|UPSTREAM_SS_PORT|UPSTREAM_SS_METHOD|UPSTREAM_SS_PASSWORD|RELAY_VLESS_TAGS)=/' "$CACHE_FILE" > "${CACHE_FILE}.tmp" || true
+    {
+        cat "${CACHE_FILE}.tmp" 2>/dev/null || true
+        echo "INSTALL_MODE=direct"
+        echo "UPSTREAM_SS_SERVER="
+        echo "UPSTREAM_SS_PORT="
+        echo "UPSTREAM_SS_METHOD="
+        echo "UPSTREAM_SS_PASSWORD="
+        echo "RELAY_VLESS_TAGS="
+    } > "$CACHE_FILE"
+    rm -f "${CACHE_FILE}.tmp"
+
+    INSTALL_MODE="direct"
+    UPSTREAM_SS_SERVER=""
+    UPSTREAM_SS_PORT=""
+    UPSTREAM_SS_METHOD=""
+    UPSTREAM_SS_PASSWORD=""
+    RELAY_VLESS_TAGS=""
+
+    apply_relay_settings || return 1
+    info "已关闭中转模式并生效"
 }
 
 action_uninstall() {
@@ -1322,48 +1784,218 @@ action_uninstall() {
     exit 0
 }
 
-show_menu() {
+show_main_menu() {
     echo
     echo "=============== sb 管理面板 ==============="
-    echo "1) 查看 URI"
-    echo "2) 查看配置文件路径"
-    echo "3) 编辑配置文件"
-    echo "4) 重置 SS 端口"
-    echo "5) 重置 HY2 端口"
-    echo "6) 重置 TUIC 端口"
-    echo "7) 重置 VLESS Reality 端口"
-    echo "8) 重置 AnyTLS Reality 端口"
-    echo "9) 查看 Reality 列表"
-    echo "10) 新增一个 Reality"
-    echo "11) 删除一个 Reality"
-    echo "12) 更新 sing-box"
-    echo "13) 查看服务状态"
-    echo "14) 重新生成 URI"
-    echo "15) 卸载 sing-box"
+    echo "1) 链接与配置"
+    echo "2) 协议管理"
+    echo "3) VLESS Reality 管理"
+    echo "4) 中转管理"
+    echo "5) 服务管理"
     echo "0) 退出"
     echo "=========================================="
 }
 
+menu_links_and_config() {
+    while true; do
+        echo
+        echo "----------- 链接与配置 -----------"
+        echo "1) 查看 URI"
+        echo "2) 重新生成 URI"
+        echo "3) 查看配置文件路径"
+        echo "4) 编辑配置文件"
+        echo "0) 返回上一级"
+        echo "----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_view_uri ;;
+            2) generate_uris && cat "$URI_FILE" ;;
+            3) action_view_config ;;
+            4) action_edit_config ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_protocols() {
+    while true; do
+        echo
+        echo "----------- 协议管理 -----------"
+        echo "1) SS 管理"
+        echo "2) HY2 管理"
+        echo "3) TUIC 管理"
+        echo "4) AnyTLS 管理"
+        echo "0) 返回上一级"
+        echo "--------------------------------"
+        read -p "请输入选项: " proto_menu
+        case "$proto_menu" in
+            1) menu_ss ;;
+            2) menu_hy2 ;;
+            3) menu_tuic ;;
+            4) menu_anytls ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_ss() {
+    while true; do
+        echo
+        echo "------------- SS 管理 -------------"
+        echo "1) 新增 SS"
+        echo "2) 删除 SS"
+        echo "3) 修改 SS 端口"
+        echo "0) 返回上一级"
+        echo "-----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_add_ss ;;
+            2) action_delete_ss ;;
+            3) action_reset_ss ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_hy2() {
+    while true; do
+        echo
+        echo "------------ HY2 管理 ------------"
+        echo "1) 新增 HY2"
+        echo "2) 删除 HY2"
+        echo "3) 修改 HY2 端口"
+        echo "0) 返回上一级"
+        echo "----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_add_hy2 ;;
+            2) action_delete_hy2 ;;
+            3) action_reset_hy2 ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_tuic() {
+    while true; do
+        echo
+        echo "------------ TUIC 管理 -----------"
+        echo "1) 新增 TUIC"
+        echo "2) 删除 TUIC"
+        echo "3) 修改 TUIC 端口"
+        echo "0) 返回上一级"
+        echo "----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_add_tuic ;;
+            2) action_delete_tuic ;;
+            3) action_reset_tuic ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_anytls() {
+    while true; do
+        echo
+        echo "----------- AnyTLS 管理 -----------"
+        echo "1) 新增 AnyTLS"
+        echo "2) 删除 AnyTLS"
+        echo "3) 修改 AnyTLS 端口"
+        echo "0) 返回上一级"
+        echo "-----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_add_anytls ;;
+            2) action_delete_anytls ;;
+            3) action_reset_anytls ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_reality() {
+    while true; do
+        echo
+        echo "-------- VLESS Reality 管理 --------"
+        echo "1) 查看 Reality 列表"
+        echo "2) 新增一个 Reality"
+        echo "3) 删除一个 Reality"
+        echo "4) 修改 Reality 端口"
+        echo "0) 返回上一级"
+        echo "------------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_list_reality ;;
+            2) action_add_reality ;;
+            3) action_delete_reality ;;
+            4) action_reset_reality ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_relay() {
+    while true; do
+        echo
+        echo "------------- 中转管理 -------------"
+        echo "1) 查看当前中转状态"
+        echo "2) 配置上游 SS 参数"
+        echo "3) 选择哪些 VLESS 走中转"
+        echo "4) 关闭中转模式"
+        echo "5) 重新应用中转配置"
+        echo "0) 返回上一级"
+        echo "------------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_show_relay_status ;;
+            2) action_configure_relay_upstream ;;
+            3) action_select_relay_vless_tags ;;
+            4) action_disable_relay_mode ;;
+            5) apply_relay_settings ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_service() {
+    while true; do
+        echo
+        echo "------------- 服务管理 -------------"
+        echo "1) 查看服务状态"
+        echo "2) 更新 sing-box"
+        echo "3) 卸载 sing-box"
+        echo "0) 返回上一级"
+        echo "------------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) service_status ;;
+            2) action_update ;;
+            3) action_uninstall ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
 while true; do
     migrate_legacy_reality_config || true
-    show_menu
+    show_main_menu
     read -p "请输入选项: " opt
     case "$opt" in
-        1) action_view_uri ;;
-        2) action_view_config ;;
-        3) action_edit_config ;;
-        4) action_reset_ss ;;
-        5) action_reset_hy2 ;;
-        6) action_reset_tuic ;;
-        7) action_reset_reality ;;
-        8) action_reset_anytls ;;
-        9) action_list_reality ;;
-        10) action_add_reality ;;
-        11) action_delete_reality ;;
-        12) action_update ;;
-        13) service_status ;;
-        14) generate_uris && cat "$URI_FILE" ;;
-        15) action_uninstall ;;
+        1) menu_links_and_config ;;
+        2) menu_protocols ;;
+        3) menu_reality ;;
+        4) menu_relay ;;
+        5) menu_service ;;
         0) exit 0 ;;
         *) warn "无效选项，请重新输入" ;;
     esac
