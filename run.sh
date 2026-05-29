@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_NAME="install-singbox-yyds.sh"
+SCRIPT_NAME="run.sh"
 
 # 可按需修改默认仓库信息
 GITHUB_USER="${GITHUB_USER:-admintors}"
