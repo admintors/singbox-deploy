@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_NAME="install-singbox-yyds.sh"
 
 # 可按需修改默认仓库信息
-GITHUB_USER="${GITHUB_USER:-yourname}"
+GITHUB_USER="${GITHUB_USER:-admintors}"
 GITHUB_REPO="${GITHUB_REPO:-singbox-deploy}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 
