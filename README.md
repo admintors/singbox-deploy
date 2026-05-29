@@ -5,7 +5,7 @@
 使用以下命令一键运行安装脚本：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库名/main/run.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/run.sh)"
 ```
 
 如果已经将仓库下载到本地，也可以直接运行：
