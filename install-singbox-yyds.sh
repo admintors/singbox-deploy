@@ -553,7 +553,7 @@ INBOUND_TUIC
         cat >> "$TEMP_INBOUNDS" <<'INBOUND_REALITY'
     {
       "type": "vless",
-      "tag": "vless-in",
+      "tag": "vless-in-1",
       "listen": "::",
       "listen_port": PORT_REALITY_PLACEHOLDER,
       "users": [
@@ -947,8 +947,15 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
 SERVICE_NAME="sing-box"
+REALITY_PUB_FILE="/etc/sing-box/.reality_pub"
+URI_FILE="/etc/sing-box/uris.txt"
 
-# 检测系统
+REALITY_TAGS=()
+REALITY_PORTS=()
+REALITY_UUIDS=()
+REALITY_SIDS=()
+REALITY_COUNT=0
+
 detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -961,9 +968,9 @@ detect_os() {
 
     if echo "$ID $ID_LIKE" | grep -qi "alpine"; then
         OS="alpine"
-    elif echo "$ID $ID_LIKE" | grep -Ei "debian|ubuntu" >/dev/null; then
+    elif echo "$ID $ID_LIKE" | grep -Eqi "debian|ubuntu"; then
         OS="debian"
-    elif echo "$ID $ID_LIKE" | grep -Ei "centos|rhel|fedora" >/dev/null; then
+    elif echo "$ID $ID_LIKE" | grep -Eqi "centos|rhel|fedora"; then
         OS="redhat"
     else
         OS="unknown"
@@ -972,7 +979,6 @@ detect_os() {
 
 detect_os
 
-# 服务控制
 service_start() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"
 }
@@ -986,85 +992,113 @@ service_status() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
 }
 
-# 生成随机值
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
-rand_pass() { openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'; }
 rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
+rand_sid() { openssl rand -hex 4 2>/dev/null || echo "01234567"; }
 
-# URL 编码
 url_encode() {
     printf "%s" "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'
 }
 
-# 读取配置
-read_config() {
+need_config() {
     if [ ! -f "$CONFIG_PATH" ]; then
         err "未找到配置文件: $CONFIG_PATH"
         return 1
     fi
-    
-    # 优先加载 .protocols 文件（确认协议标记）
+}
+
+migrate_legacy_reality_config() {
+    need_config || return 1
+
+    local has_legacy has_new
+    has_legacy=$(jq -r '[.inbounds[]? | select(.type=="vless" and .tag=="vless-in" and .tls.reality.enabled==true)] | length' "$CONFIG_PATH" 2>/dev/null || echo 0)
+    has_new=$(jq -r '[.inbounds[]? | select(.type=="vless" and (.tag|test("^vless-in-[0-9]+$")) and .tls.reality.enabled==true)] | length' "$CONFIG_PATH" 2>/dev/null || echo 0)
+
+    if [ "$has_legacy" -gt 0 ] && [ "$has_new" -eq 0 ]; then
+        info "检测到旧版 VLESS Reality 配置，正在迁移..."
+        cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.migrate.$(date +%s)"
+
+        jq '
+        .inbounds |= map(
+          if .type=="vless" and .tag=="vless-in" and .tls.reality.enabled==true
+          then .tag="vless-in-1"
+          else .
+          end
+        )
+        ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+        info "旧版 Reality 配置已迁移为 vless-in-1"
+    fi
+}
+
+read_config() {
+    need_config || return 1
+
     PROTOCOL_FILE="/etc/sing-box/.protocols"
-    if [ -f "$PROTOCOL_FILE" ]; then
-        . "$PROTOCOL_FILE"
-    fi
-    
-    # 加载缓存文件（包含端口密码等详细配置）
-    if [ -f "$CACHE_FILE" ]; then
-        . "$CACHE_FILE"
-    fi
-    
-    # 确保有默认值
+    [ -f "$PROTOCOL_FILE" ] && . "$PROTOCOL_FILE"
+    [ -f "$CACHE_FILE" ] && . "$CACHE_FILE"
+
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
     ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
     CUSTOM_IP="${CUSTOM_IP:-}"
 
-    # 读取各协议配置
     if [ "${ENABLE_SS:-false}" = "true" ]; then
         SS_PORT=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
         SS_PSK=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .password // empty' "$CONFIG_PATH" | head -n1)
         SS_METHOD=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .method // empty' "$CONFIG_PATH" | head -n1)
     fi
-    
+
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         HY2_PORT=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
         HY2_PSK=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
     fi
-    
+
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
         TUIC_PORT=$(jq -r '.inbounds[] | select(.type=="tuic") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
         TUIC_UUID=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
         TUIC_PSK=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
     fi
-    
-# Reality 公共参数（Reality / AnyTLS 共用）
-if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-    REALITY_SID=$(jq -r '
-        .inbounds[]
-        | select(.tls.reality.enabled == true)
-        | .tls.reality.short_id[0] // empty
-    ' "$CONFIG_PATH" | head -n1)
 
-    [ -f /etc/sing-box/.reality_pub ] && REALITY_PUB=$(cat /etc/sing-box/.reality_pub)
-fi
+    if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
+        REALITY_SID=$(jq -r '.inbounds[] | select(.tls.reality.enabled == true) | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1)
+        [ -f "$REALITY_PUB_FILE" ] && REALITY_PUB=$(cat "$REALITY_PUB_FILE")
+    fi
 
-# VLESS Reality 专属参数
-if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-    REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
+        REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    fi
 
-    REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-
-    REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
-fi
-
-if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-    ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
-fi
+    if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
+        ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
+        ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+    fi
 }
 
-# 获取公网IP（原始方法）
+read_reality_list() {
+    migrate_legacy_reality_config || return 1
+    need_config || return 1
+
+    REALITY_TAGS=()
+    REALITY_PORTS=()
+    REALITY_UUIDS=()
+    REALITY_SIDS=()
+    REALITY_COUNT=0
+
+    mapfile -t REALITY_TAGS < <(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .tag // empty' "$CONFIG_PATH")
+    mapfile -t REALITY_PORTS < <(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t REALITY_UUIDS < <(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .users[0].uuid // empty' "$CONFIG_PATH")
+    mapfile -t REALITY_SIDS < <(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.short_id[0] // empty' "$CONFIG_PATH")
+
+    REALITY_COUNT="${#REALITY_TAGS[@]}"
+    REALITY_SNI=$(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .tls.server_name // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_PK=$(jq -r '.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    [ -f "$REALITY_PUB_FILE" ] && REALITY_PUB=$(cat "$REALITY_PUB_FILE" 2>/dev/null || true)
+    REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+}
+
 get_public_ip() {
     local ip=""
     for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
@@ -1074,11 +1108,9 @@ get_public_ip() {
     echo "YOUR_SERVER_IP"
 }
 
-# 生成并保存URI
 generate_uris() {
     read_config || return 1
 
-    # 优先使用用户自定义入口 IP
     if [ -n "${CUSTOM_IP:-}" ]; then
         PUBLIC_IP="$CUSTOM_IP"
     else
@@ -1086,75 +1118,57 @@ generate_uris() {
     fi
 
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
-    
-    URI_FILE="/etc/sing-box/uris.txt"
-    > "$URI_FILE"
-    
+    : > "$URI_FILE"
+
     if [ "${ENABLE_SS:-false}" = "true" ]; then
         ss_userinfo="${SS_METHOD}:${SS_PSK}"
         ss_encoded=$(url_encode "$ss_userinfo")
         ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-        
         echo "=== Shadowsocks (SS) ===" >> "$URI_FILE"
         echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
         echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        echo >> "$URI_FILE"
     fi
-    
+
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         hy2_encoded=$(url_encode "$HY2_PSK")
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
         echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        echo >> "$URI_FILE"
     fi
-    
+
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
         tuic_encoded=$(url_encode "$TUIC_PSK")
         echo "=== TUIC ===" >> "$URI_FILE"
-        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#tuic${node_suffix}" >> "$URI_FILE"
+        echo >> "$URI_FILE"
     fi
-    
+
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
-        echo "=== VLESS Reality ===" >> "$URI_FILE"
-        echo "vless://${REALITY_UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        read_reality_list || return 1
+        if [ "$REALITY_COUNT" -gt 0 ]; then
+            echo "=== VLESS Reality ===" >> "$URI_FILE"
+            for ((i=0; i<REALITY_COUNT; i++)); do
+                echo "vless://${REALITY_UUIDS[$i]}@${PUBLIC_IP}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            done
+            echo >> "$URI_FILE"
+        fi
     fi
-    
+
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-        anytls_user_encoded=$(url_encode "$ANYTLS_USER")
-        anytls_pass_encoded=$(url_encode "$ANYTLS_PSK")
+        anytls_encoded=$(url_encode "$ANYTLS_PSK")
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
-        echo "anytls://${anytls_pass_encoded}@${PUBLIC_IP}:${ANYTLS_PORT}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        echo "anytls://${ANYTLS_USER}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORT}?sni=${REALITY_SNI}&insecure=1#anytls${node_suffix}" >> "$URI_FILE"
+        echo >> "$URI_FILE"
     fi
-
-    info "URI 已保存到: $URI_FILE"
 }
 
-# 查看URI
-action_view_uri() {
-    info "正在生成并显示 URI..."
-    generate_uris || { err "生成 URI 失败"; return 1; }
-    echo ""
-    cat /etc/sing-box/uris.txt
-}
+action_view_uri() { info "正在生成并显示 URI..."; generate_uris || { err "生成 URI 失败"; return 1; }; echo; cat "$URI_FILE"; }
+action_view_config() { echo "$CONFIG_PATH"; }
 
-# 查看配置文件路径
-action_view_config() {
-    echo "$CONFIG_PATH"
-}
-
-# 编辑配置
 action_edit_config() {
-    if [ ! -f "$CONFIG_PATH" ]; then
-        err "配置文件不存在: $CONFIG_PATH"
-        return 1
-    fi
-    
-    ${EDITOR:-nano} "$CONFIG_PATH" 2>/dev/null || ${EDITOR:-vi} "$CONFIG_PATH"
-    
+    [ -f "$CONFIG_PATH" ] || { err "配置文件不存在: $CONFIG_PATH"; return 1; }
+    "${EDITOR:-vi}" "$CONFIG_PATH"
     if command -v sing-box >/dev/null 2>&1; then
         if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
             info "配置校验通过,已重启服务"
@@ -1162,537 +1176,197 @@ action_edit_config() {
             generate_uris || true
         else
             warn "配置校验失败,服务未重启"
-        fi
-    fi
-}
-
-# 重置SS端口
-action_reset_ss() {
-    read_config || return 1
-    
-    if [ "${ENABLE_SS:-false}" != "true" ]; then
-        err "SS 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
-    new_port="${new_port:-$SS_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 SS 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置HY2端口
-action_reset_hy2() {
-    read_config || return 1
-    
-    if [ "${ENABLE_HY2:-false}" != "true" ]; then
-        err "HY2 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
-    new_port="${new_port:-$HY2_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 HY2 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置TUIC端口
-action_reset_tuic() {
-    read_config || return 1
-    
-    if [ "${ENABLE_TUIC:-false}" != "true" ]; then
-        err "TUIC 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
-    new_port="${new_port:-$TUIC_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 TUIC 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置Vless Reality端口
-action_reset_reality() {
-    read_config || return 1
-    
-    if [ "${ENABLE_REALITY:-false}" != "true" ]; then
-        err "Vless Reality 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 Vless Reality 端口(回车保持 $REALITY_PORT): " new_port
-    new_port="${new_port:-$REALITY_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 Vless Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置AnyTLS Reality端口
-action_reset_anytls() {
-    read_config || return 1
-
-    if [ "${ENABLE_ANYTLS:-false}" != "true" ]; then
-        err "AnyTLS Reality 协议未启用"
-        return 1
-    fi
-
-    read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
-    new_port="${new_port:-$ANYTLS_PORT}"
-
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
-    info "已启动服务并更新 AnyTLS Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 更新sing-box
-action_update() {
-    info "开始更新 sing-box..."
-    if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
-    else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
-    fi
-    
-    info "更新完成,已重启服务..."
-    if command -v sing-box >/dev/null 2>&1; then
-        NEW_VER=$(sing-box version 2>/dev/null | head -n1)
-        info "当前版本: $NEW_VER"
-        service_restart || warn "重启失败"
-    fi
-}
-
-# 卸载
-action_uninstall() {
-    read -p "确认卸载 sing-box?(y/N): " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
-    
-    info "正在卸载..."
-    service_stop || true
-    if [ "$OS" = "alpine" ]; then
-        rc-update del sing-box default 2>/dev/null || true
-        rm -f /etc/init.d/sing-box
-        apk del sing-box 2>/dev/null || true
-    else
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload 2>/dev/null || true
-        apt purge -y sing-box >/dev/null 2>&1 || true
-    fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
-    info "卸载完成"
-}
-
-# 生成线路机脚本
-action_generate_relay() {
-    read_config || return 1
-    
-    # 检查是否启用了SS
-    if [ "${ENABLE_SS:-false}" != "true" ]; then
-        warn "未检测到 SS 协议,需要先部署 SS 作为入站"
-        read -p "是否现在部署 SS 协议?(y/N): " deploy_ss
-        if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
-            info "开始部署 SS 协议..."
-            
-            # 让用户选择端口
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_SS_PORT
-            SS_PORT="${USER_SS_PORT:-$(rand_port)}"
-            SS_PSK=$(rand_pass)
-            SS_METHOD="aes-128-gcm"
-            
-            info "SS 端口: $SS_PORT | 密码已自动生成"
-            
-            info "正在停止服务..."
-            service_stop || warn "停止服务失败"
-            
-            cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-            
-            # 添加 SS inbound
-            jq --argjson port "$SS_PORT" --arg psk "$SS_PSK" '
-            .inbounds += [{
-              "type": "shadowsocks",
-              "listen": "::",
-              "listen_port": $port,
-              "method": "aes-128-gcm",
-              "password": $psk,
-              "tag": "ss-in"
-            }]
-            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-            
-            # 更新缓存和协议标记
-            sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$CACHE_FILE" 2>/dev/null || echo "ENABLE_SS=true" >> "$CACHE_FILE"
-            echo "SS_PORT=$SS_PORT" >> "$CACHE_FILE"
-            echo "SS_PSK=$SS_PSK" >> "$CACHE_FILE"
-            echo "SS_METHOD=$SS_METHOD" >> "$CACHE_FILE"
-            
-            # 同步更新协议标记文件
-            PROTOCOL_FILE="/etc/sing-box/.protocols"
-            if [ -f "$PROTOCOL_FILE" ]; then
-                sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$PROTOCOL_FILE"
-            else
-                echo "ENABLE_SS=true" >> "$PROTOCOL_FILE"
-            fi
-            
-            # 更新当前会话变量
-            ENABLE_SS=true
-            
-            info "SS 已部署 - 端口: $SS_PORT"
-            service_start || warn "启动服务失败"
-            sleep 1
-            
-            # 重新读取配置
-            read_config
-        else
-            err "取消生成线路机脚本"
             return 1
         fi
     fi
-    
-    # 线路机模板使用 CUSTOM_IP（若设置）或当前公共 IP
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        INBOUND_IP="${CUSTOM_IP}"
-    else
-        INBOUND_IP="$(get_public_ip)"
-    fi
-
-    PUBLIC_IP="$INBOUND_IP"
-    RELAY_SCRIPT="/tmp/relay-install.sh"
-    
-    info "正在生成线路机脚本: $RELAY_SCRIPT"
-    
-    cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
-[ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
-
-detect_os(){
-    . /etc/os-release 2>/dev/null || true
-    case "${ID:-}" in
-        alpine) OS=alpine ;;
-        debian|ubuntu) OS=debian ;;
-        centos|rhel|fedora) OS=redhat ;;
-        *) OS=unknown ;;
-    esac
-}
-detect_os
-
-info "安装依赖..."
-case "$OS" in
-    alpine) apk update; apk add --no-cache curl jq bash openssl ca-certificates ;;
-    debian) apt-get update -y; apt-get install -y curl jq bash openssl ca-certificates ;;
-    redhat) yum install -y curl jq bash openssl ca-certificates ;;
-esac
-
-info "安装 sing-box..."
-case "$OS" in
-    alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
-esac
-
-UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
-
-info "生成 Reality 密钥对"
-REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
-REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null || echo "0123456789abcdef")
-
-read -p "请输入线路机监听端口(留空随机 20000-65000): " USER_PORT
-LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}"
-
-mkdir -p /etc/sing-box
-
-cat > /etc/sing-box/config.json <<EOF
-{
-  "log": { "level": "info", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "vless",
-      "listen": "::",
-      "listen_port": $LISTEN_PORT,
-      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
-      "tls": {
-        "enabled": true,
-        "server_name": "__REALITY_SNI__",
-        "reality": {
-          "enabled": true,
-          "handshake": { "server": "__REALITY_SNI__", "server_port": 443 },
-          "private_key": "$REALITY_PK",
-          "short_id": ["$REALITY_SID"]
-        }
-      },
-      "tag": "vless-in"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "shadowsocks",
-      "server": "__INBOUND_IP__",
-      "server_port": __INBOUND_PORT__,
-      "method": "__INBOUND_METHOD__",
-      "password": "__INBOUND_PASSWORD__",
-      "tag": "relay-out"
-    },
-    { "type": "direct", "tag": "direct-out" }
-  ],
-  "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
-}
-EOF
-
-if [ "$OS" = "alpine" ]; then
-    cat > /etc/init.d/sing-box <<'SVC'
-#!/sbin/openrc-run
-name="sing-box"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
-
-depend() { need net; }
-SVC
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default
-    rc-service sing-box restart
-else
-    cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
-[Unit]
-Description=Sing-box Relay
-After=network.target
-[Service]
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=10s
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
-fi
-
-PUB_IP=$(curl -s https://api.ipify.org 2>/dev/null || echo "YOUR_RELAY_IP")
-
-# 生成并保存链接
-RELAY_URI="vless://$UUID@$PUB_IP:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=__REALITY_SNI__&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#relay"
-
-mkdir -p /etc/sing-box
-echo "$RELAY_URI" > /etc/sing-box/relay_uri.txt
-
-echo ""
-info "✅ 安装完成"
-echo "=============== 中转节点 Reality 链接 ==============="
-echo "$RELAY_URI"
-echo "===================================================="
-echo ""
-info "💡 链接已保存到: /etc/sing-box/relay_uri.txt"
-info "💡 查看链接命令: cat /etc/sing-box/relay_uri.txt"
-RELAY_EOF
-
-    # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
-    sed -i "s|__INBOUND_IP__|$INBOUND_IP|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
-    sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
-    
-    chmod +x "$RELAY_SCRIPT"
-    
-    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
-    echo ""
-    info "请复制以下内容到线路机执行:"
-    echo "----------------------------------------"
-    cat "$RELAY_SCRIPT"
-    echo "----------------------------------------"
-    echo ""
-    info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
-    echo ""
-    info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
 }
 
-# 动态生成菜单
+action_reset_ss() {
+    read_config || return 1
+    [ "${ENABLE_SS:-false}" = "true" ] || { err "SS 协议未启用"; return 1; }
+    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
+    new_port="${new_port:-$SS_PORT}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --argjson port "$new_port" '.inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    service_restart || warn "重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_reset_hy2() {
+    read_config || return 1
+    [ "${ENABLE_HY2:-false}" = "true" ] || { err "HY2 协议未启用"; return 1; }
+    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
+    new_port="${new_port:-$HY2_PORT}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --argjson port "$new_port" '.inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    service_restart || warn "重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_reset_tuic() {
+    read_config || return 1
+    [ "${ENABLE_TUIC:-false}" = "true" ] || { err "TUIC 协议未启用"; return 1; }
+    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
+    new_port="${new_port:-$TUIC_PORT}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --argjson port "$new_port" '.inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    service_restart || warn "重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_list_reality() {
+    read_reality_list || return 1
+    if [ "$REALITY_COUNT" -eq 0 ]; then warn "当前没有 VLESS Reality 节点"; return 0; fi
+    echo
+    echo "当前 VLESS Reality 列表："
+    for ((i=0; i<REALITY_COUNT; i++)); do
+        echo "$((i+1))) ${REALITY_TAGS[$i]} | port: ${REALITY_PORTS[$i]} | uuid: ${REALITY_UUIDS[$i]} | sid: ${REALITY_SIDS[$i]}"
+    done
+    echo
+}
+
+action_add_reality() {
+    read_reality_list || return 1
+    [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增"; return 1; }
+    read -p "输入新的 VLESS Reality 端口(留空随机 10000-60000): " new_port
+    new_port="${new_port:-$(rand_port)}"
+    next_index=$(jq -r '[.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true and (.tag|test("^vless-in-[0-9]+$"))) | (.tag | split("-") | last | tonumber)] | max // 0' "$CONFIG_PATH")
+    next_index=$((next_index + 1))
+    new_tag="vless-in-$next_index"
+    new_uuid="$(rand_uuid)"
+    new_sid="$(rand_sid)"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sid "$new_sid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" '
+      .inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$port,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
+    service_restart || warn "服务重启失败"
+    generate_uris || warn "生成 URI 失败"
+    info "已新增 ${new_tag}"
+}
+
+action_delete_reality() {
+    read_reality_list || return 1
+    [ "$REALITY_COUNT" -gt 0 ] || { warn "当前没有可删除的 VLESS Reality 节点"; return 0; }
+    echo
+    echo "请选择要删除的 VLESS Reality："
+    for ((i=0; i<REALITY_COUNT; i++)); do echo "$((i+1))) ${REALITY_TAGS[$i]} | port: ${REALITY_PORTS[$i]}"; done
+    echo
+    read -p "输入编号: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || { err "输入无效"; return 1; }
+    idx=$((choice - 1))
+    [ "$idx" -ge 0 ] && [ "$idx" -lt "$REALITY_COUNT" ] || { err "编号超出范围"; return 1; }
+    target_tag="${REALITY_TAGS[$idx]}"
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg tag "$target_tag" '.inbounds |= map(select(.tag != $tag))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
+    service_restart || warn "服务重启失败"
+    generate_uris || warn "生成 URI 失败"
+    info "已删除 ${target_tag}"
+}
+
+action_reset_reality() {
+    read_reality_list || return 1
+    [ "$REALITY_COUNT" -gt 0 ] || { err "当前没有 VLESS Reality 节点"; return 1; }
+    echo
+    echo "请选择要修改端口的 VLESS Reality："
+    for ((i=0; i<REALITY_COUNT; i++)); do echo "$((i+1))) ${REALITY_TAGS[$i]} | 当前端口: ${REALITY_PORTS[$i]}"; done
+    echo
+    read -p "输入编号: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || { err "输入无效"; return 1; }
+    idx=$((choice - 1))
+    [ "$idx" -ge 0 ] && [ "$idx" -lt "$REALITY_COUNT" ] || { err "编号超出范围"; return 1; }
+    target_tag="${REALITY_TAGS[$idx]}"
+    current_port="${REALITY_PORTS[$idx]}"
+    read -p "输入新的端口(回车保持 $current_port): " new_port
+    new_port="${new_port:-$current_port}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag == $tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; err "配置校验失败，已回滚"; return 1; fi
+    service_restart || warn "重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_reset_anytls() {
+    read_config || return 1
+    [ "${ENABLE_ANYTLS:-false}" = "true" ] || { err "AnyTLS Reality 协议未启用"; return 1; }
+    read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
+    new_port="${new_port:-$ANYTLS_PORT}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --argjson port "$new_port" '.inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    service_restart || warn "重启失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_update() {
+    info "开始更新 sing-box..."
+    if [ "$OS" = "alpine" ]; then apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh); else bash <(curl -fsSL https://sing-box.app/install.sh); fi
+    info "更新完成,已重启服务..."
+    if command -v sing-box >/dev/null 2>&1; then NEW_VER=$(sing-box version 2>/dev/null | head -n1); info "当前版本: $NEW_VER"; service_restart || warn "重启失败"; fi
+}
+
+action_uninstall() {
+    info "正在卸载 sing-box..."
+    service_stop || true
+    if [ "$OS" = "alpine" ]; then apk del sing-box || true; rm -f /etc/init.d/sing-box; else systemctl disable sing-box || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload || true; fi
+    rm -rf /etc/sing-box
+    rm -f /usr/local/bin/sb
+    info "卸载完成"
+    exit 0
+}
+
 show_menu() {
-    read_config 2>/dev/null || true
-    
-    cat <<'MENU'
-
-==========================
- Sing-box 管理面板 (快速指令sb)
-==========================
-1) 查看协议链接
-2) 查看配置文件路径
-3) 编辑配置文件
-MENU
-
-    # 构建协议重置选项映射
-    declare -g -A MENU_MAP
-    local option=4
-    
-    if [ "${ENABLE_SS:-false}" = "true" ]; then
-        echo "$option) 重置 SS 端口"
-        MENU_MAP[$option]="reset_ss"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        echo "$option) 重置 HY2 端口"
-        MENU_MAP[$option]="reset_hy2"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        echo "$option) 重置 TUIC 端口"
-        MENU_MAP[$option]="reset_tuic"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        echo "$option) 重置 Vless Reality 端口"
-        MENU_MAP[$option]="reset_reality"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-        echo "$option) 重置 AnyTLS Reality 端口"
-        MENU_MAP[$option]="reset_anytls"
-        option=$((option + 1))
-    fi
-
-    # 固定功能选项
-    MENU_MAP[$option]="start"
-    echo "$option) 启动服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="stop"
-    echo "$((option))) 停止服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="restart"
-    echo "$((option))) 重启服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="status"
-    echo "$((option))) 查看状态"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="update"
-    echo "$((option))) 更新 sing-box"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="relay"
-    echo "$((option))) 生成线路机脚本(出口为本机ss协议)"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="uninstall"
-    echo "$((option))) 卸载 sing-box"
-    
-    cat <<MENU2
-0) 退出
-==========================
-MENU2
+    echo
+    echo "=============== sb 管理面板 ==============="
+    echo "1) 查看 URI"
+    echo "2) 查看配置文件路径"
+    echo "3) 编辑配置文件"
+    echo "4) 重置 SS 端口"
+    echo "5) 重置 HY2 端口"
+    echo "6) 重置 TUIC 端口"
+    echo "7) 重置 VLESS Reality 端口"
+    echo "8) 重置 AnyTLS Reality 端口"
+    echo "9) 查看 Reality 列表"
+    echo "10) 新增一个 Reality"
+    echo "11) 删除一个 Reality"
+    echo "12) 更新 sing-box"
+    echo "13) 查看服务状态"
+    echo "14) 重新生成 URI"
+    echo "15) 卸载 sing-box"
+    echo "0) 退出"
+    echo "=========================================="
 }
 
-# 主循环
 while true; do
+    migrate_legacy_reality_config || true
     show_menu
     read -p "请输入选项: " opt
-    
-    # 处理退出
-    if [ "$opt" = "0" ]; then
-        exit 0
-    fi
-    
-    # 处理固定选项
     case "$opt" in
         1) action_view_uri ;;
         2) action_view_config ;;
         3) action_edit_config ;;
-        *)
-            # 处理动态选项
-            action="${MENU_MAP[$opt]:-}"
-            case "$action" in
-                reset_ss) action_reset_ss ;;
-                reset_hy2) action_reset_hy2 ;;
-                reset_tuic) action_reset_tuic ;;
-                reset_reality) action_reset_reality ;;
-                reset_anytls) action_reset_anytls ;;
-                start) service_start && info "已启动" ;;
-                stop) service_stop && info "已停止" ;;
-                restart) service_restart && info "已重启" ;;
-                status) service_status ;;
-                update) action_update ;;
-                relay) action_generate_relay ;;
-                uninstall) action_uninstall; exit 0 ;;
-                *) warn "无效选项: $opt" ;;
-            esac
-            ;;
+        4) action_reset_ss ;;
+        5) action_reset_hy2 ;;
+        6) action_reset_tuic ;;
+        7) action_reset_reality ;;
+        8) action_reset_anytls ;;
+        9) action_list_reality ;;
+        10) action_add_reality ;;
+        11) action_delete_reality ;;
+        12) action_update ;;
+        13) service_status ;;
+        14) generate_uris && cat "$URI_FILE" ;;
+        15) action_uninstall ;;
+        0) exit 0 ;;
+        *) warn "无效选项，请重新输入" ;;
     esac
-    
-    echo ""
 done
 SB_SCRIPT
 
