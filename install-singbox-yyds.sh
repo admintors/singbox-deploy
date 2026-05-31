@@ -1125,6 +1125,18 @@ need_config() {
     fi
 }
 
+inbound_tag_exists() {
+    local tag="$1"
+    need_config || return 1
+    [ "$(jq -r --arg tag "$tag" '[.inbounds[]? | select(.tag == $tag)] | length' "$CONFIG_PATH" 2>/dev/null || echo 0)" -gt 0 ]
+}
+
+inbound_type_exists() {
+    local type="$1"
+    need_config || return 1
+    [ "$(jq -r --arg type "$type" '[.inbounds[]? | select(.type == $type)] | length' "$CONFIG_PATH" 2>/dev/null || echo 0)" -gt 0 ]
+}
+
 load_protocol_flags() {
     ENABLE_SS=false
     ENABLE_HY2=false
@@ -1283,6 +1295,95 @@ read_reality_list() {
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
 }
 
+read_ss_list() {
+    need_config || return 1
+    SS_TAGS=()
+    SS_PORTS=()
+    SS_METHODS=()
+    SS_PSKS=()
+    mapfile -t SS_TAGS < <(jq -r '.inbounds[]? | select(.type=="shadowsocks") | .tag // empty' "$CONFIG_PATH")
+    mapfile -t SS_PORTS < <(jq -r '.inbounds[]? | select(.type=="shadowsocks") | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t SS_METHODS < <(jq -r '.inbounds[]? | select(.type=="shadowsocks") | .method // empty' "$CONFIG_PATH")
+    mapfile -t SS_PSKS < <(jq -r '.inbounds[]? | select(.type=="shadowsocks") | .password // empty' "$CONFIG_PATH")
+    SS_COUNT="${#SS_TAGS[@]}"
+}
+
+read_hy2_list() {
+    need_config || return 1
+    HY2_TAGS=()
+    HY2_PORTS=()
+    HY2_PSKS=()
+    mapfile -t HY2_TAGS < <(jq -r '.inbounds[]? | select(.type=="hysteria2") | .tag // empty' "$CONFIG_PATH")
+    mapfile -t HY2_PORTS < <(jq -r '.inbounds[]? | select(.type=="hysteria2") | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t HY2_PSKS < <(jq -r '.inbounds[]? | select(.type=="hysteria2") | .users[0].password // empty' "$CONFIG_PATH")
+    HY2_COUNT="${#HY2_TAGS[@]}"
+}
+
+read_tuic_list() {
+    need_config || return 1
+    TUIC_TAGS=()
+    TUIC_PORTS=()
+    TUIC_UUIDS=()
+    TUIC_PSKS=()
+    mapfile -t TUIC_TAGS < <(jq -r '.inbounds[]? | select(.type=="tuic") | .tag // empty' "$CONFIG_PATH")
+    mapfile -t TUIC_PORTS < <(jq -r '.inbounds[]? | select(.type=="tuic") | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t TUIC_UUIDS < <(jq -r '.inbounds[]? | select(.type=="tuic") | .users[0].uuid // empty' "$CONFIG_PATH")
+    mapfile -t TUIC_PSKS < <(jq -r '.inbounds[]? | select(.type=="tuic") | .users[0].password // empty' "$CONFIG_PATH")
+    TUIC_COUNT="${#TUIC_TAGS[@]}"
+}
+
+read_anytls_list() {
+    need_config || return 1
+    ANYTLS_TAGS=()
+    ANYTLS_PORTS=()
+    ANYTLS_USERS=()
+    ANYTLS_PSKS=()
+    ANYTLS_SIDS=()
+    mapfile -t ANYTLS_TAGS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .tag // empty' "$CONFIG_PATH")
+    mapfile -t ANYTLS_PORTS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t ANYTLS_USERS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH")
+    mapfile -t ANYTLS_PSKS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH")
+    mapfile -t ANYTLS_SIDS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .tls.reality.short_id[0] // empty' "$CONFIG_PATH")
+    ANYTLS_COUNT="${#ANYTLS_TAGS[@]}"
+}
+
+next_protocol_tag() {
+    local prefix="$1"
+    local next
+    next=$(jq -r --arg prefix "$prefix" '[.inbounds[]? | .tag // empty | select(. == $prefix or test("^" + $prefix + "-[0-9]+$")) | if . == $prefix then 1 else (split("-") | last | tonumber) end] | max // 0 | . + 1' "$CONFIG_PATH" 2>/dev/null)
+    if [ "$next" -le 1 ]; then
+        echo "$prefix"
+    else
+        echo "$prefix-$next"
+    fi
+}
+
+select_tag_from_list() {
+    local title="$1"; shift
+    local tags=("$@")
+    local count="${#tags[@]}"
+    [ "$count" -gt 0 ] || return 1
+    echo
+    echo "$title"
+    local i
+    for ((i=0; i<count; i++)); do
+        echo "$((i+1))) ${tags[$i]}"
+    done
+    while true; do
+        read -p "请选择编号: " choice
+        case "$choice" in
+            ''|*[!0-9]*) warn "请输入数字编号" ;;
+            *)
+                if [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+                    echo "${tags[$((choice-1))]}"
+                    return 0
+                fi
+                warn "编号超出范围"
+                ;;
+        esac
+    done
+}
+
 get_public_ip() {
     local ip=""
     for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
@@ -1298,27 +1399,36 @@ generate_uris() {
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     : > "$URI_FILE"
 
-    if [ "${ENABLE_SS:-false}" = "true" ]; then
-        ss_userinfo="${SS_METHOD}:${SS_PSK}"
-        ss_encoded=$(url_encode "$ss_userinfo")
-        ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
+    read_ss_list || return 1
+    if [ "$SS_COUNT" -gt 0 ]; then
         echo "=== Shadowsocks (SS) ===" >> "$URI_FILE"
-        echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
-        echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
+        for ((i=0; i<SS_COUNT; i++)); do
+            ss_userinfo="${SS_METHODS[$i]}:${SS_PSKS[$i]}"
+            ss_encoded=$(url_encode "$ss_userinfo")
+            ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
+            echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+        done
         echo >> "$URI_FILE"
     fi
 
-    if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        hy2_encoded=$(url_encode "$HY2_PSK")
+    read_hy2_list || return 1
+    if [ "$HY2_COUNT" -gt 0 ]; then
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
-        echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
+        for ((i=0; i<HY2_COUNT; i++)); do
+            hy2_encoded=$(url_encode "${HY2_PSKS[$i]}")
+            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+        done
         echo >> "$URI_FILE"
     fi
 
-    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        tuic_encoded=$(url_encode "$TUIC_PSK")
+    read_tuic_list || return 1
+    if [ "$TUIC_COUNT" -gt 0 ]; then
         echo "=== TUIC ===" >> "$URI_FILE"
-        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#tuic${node_suffix}" >> "$URI_FILE"
+        for ((i=0; i<TUIC_COUNT; i++)); do
+            tuic_encoded=$(url_encode "${TUIC_PSKS[$i]}")
+            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+        done
         echo >> "$URI_FILE"
     fi
 
@@ -1333,10 +1443,13 @@ generate_uris() {
         fi
     fi
 
-    if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-        anytls_encoded=$(url_encode "$ANYTLS_PSK")
+    read_anytls_list || return 1
+    if [ "$ANYTLS_COUNT" -gt 0 ]; then
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
-        echo "anytls://${ANYTLS_USER}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORT}?sni=${REALITY_SNI}&insecure=1#anytls${node_suffix}" >> "$URI_FILE"
+        for ((i=0; i<ANYTLS_COUNT; i++)); do
+            anytls_encoded=$(url_encode "${ANYTLS_PSKS[$i]}")
+            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+        done
         echo >> "$URI_FILE"
     fi
 }
@@ -1406,25 +1519,27 @@ action_edit_config() {
 }
 
 action_reset_ss() {
-    read_config || return 1
-    [ "${ENABLE_SS:-false}" = "true" ] || { err "SS 协议未启用"; return 1; }
-    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
-    new_port="${new_port:-$SS_PORT}"
+    read_ss_list || return 1
+    [ "$SS_COUNT" -gt 0 ] || { err "SS 协议未启用"; return 1; }
+    target_tag=$(select_tag_from_list "当前 SS 列表：" "${SS_TAGS[@]}") || return 1
+    current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    read -p "输入新的 SS 端口(回车保持 ${current_port}): " new_port
+    new_port="${new_port:-$current_port}"
     backup_config
-    jq --argjson port "$new_port" '.inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
 }
 
 action_add_ss() {
     read_config || return 1
-    [ "${ENABLE_SS:-false}" != "true" ] || { warn "SS 已存在"; return 0; }
     read -p "输入 SS 端口(留空随机 10000-60000): " new_port
     read -p "输入 SS 加密方式(默认 2022-blake3-aes-128-gcm): " new_method
     read -p "输入 SS 密码(留空自动生成): " new_psk
     new_port="${new_port:-$(rand_port)}"
     new_method="${new_method:-2022-blake3-aes-128-gcm}"
     new_psk="${new_psk:-$(rand_pass)}"
-    inbound=$(jq -nc --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:"ss-in"}')
+    new_tag=$(next_protocol_tag "ss-in")
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:$tag}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_SS true
@@ -1432,34 +1547,38 @@ action_add_ss() {
 }
 
 action_delete_ss() {
-    read_config || return 1
-    [ "${ENABLE_SS:-false}" = "true" ] || { warn "SS 未启用"; return 0; }
-    read -p "确认删除 SS 协议? [y/N]: " confirm
+    read_ss_list || return 1
+    [ "$SS_COUNT" -gt 0 ] || { warn "SS 未启用"; return 0; }
+    target_tag=$(select_tag_from_list "当前 SS 列表：" "${SS_TAGS[@]}") || return 1
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
     case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
     backup_config
-    jq_remove_by_tag "ss-in"
-    set_protocol_flag ENABLE_SS false
+    jq_remove_by_tag "$target_tag"
+    read_ss_list || true
+    [ "${SS_COUNT:-0}" -gt 0 ] && set_protocol_flag ENABLE_SS true || set_protocol_flag ENABLE_SS false
     validate_and_restart
 }
 
 action_reset_hy2() {
-    read_config || return 1
-    [ "${ENABLE_HY2:-false}" = "true" ] || { err "HY2 协议未启用"; return 1; }
-    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
-    new_port="${new_port:-$HY2_PORT}"
+    read_hy2_list || return 1
+    [ "$HY2_COUNT" -gt 0 ] || { err "HY2 协议未启用"; return 1; }
+    target_tag=$(select_tag_from_list "当前 HY2 列表：" "${HY2_TAGS[@]}") || return 1
+    current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    read -p "输入新的 HY2 端口(回车保持 ${current_port}): " new_port
+    new_port="${new_port:-$current_port}"
     backup_config
-    jq --argjson port "$new_port" '.inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
 }
 
 action_add_hy2() {
     read_config || return 1
-    [ "${ENABLE_HY2:-false}" != "true" ] || { warn "HY2 已存在"; return 0; }
     read -p "输入 HY2 端口(留空随机 10000-60000): " new_port
     read -p "输入 HY2 密码(留空自动生成): " new_psk
     new_port="${new_port:-$(rand_port)}"
     new_psk="${new_psk:-$(rand_pass)}"
-    inbound=$(jq -nc --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    new_tag=$(next_protocol_tag "hy2-in")
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:$tag,listen:"::",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_HY2 true
@@ -1467,36 +1586,40 @@ action_add_hy2() {
 }
 
 action_delete_hy2() {
-    read_config || return 1
-    [ "${ENABLE_HY2:-false}" = "true" ] || { warn "HY2 未启用"; return 0; }
-    read -p "确认删除 HY2 协议? [y/N]: " confirm
+    read_hy2_list || return 1
+    [ "$HY2_COUNT" -gt 0 ] || { warn "HY2 未启用"; return 0; }
+    target_tag=$(select_tag_from_list "当前 HY2 列表：" "${HY2_TAGS[@]}") || return 1
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
     case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
     backup_config
-    jq_remove_by_tag "hy2-in"
-    set_protocol_flag ENABLE_HY2 false
+    jq_remove_by_tag "$target_tag"
+    read_hy2_list || true
+    [ "${HY2_COUNT:-0}" -gt 0 ] && set_protocol_flag ENABLE_HY2 true || set_protocol_flag ENABLE_HY2 false
     validate_and_restart
 }
 
 action_reset_tuic() {
-    read_config || return 1
-    [ "${ENABLE_TUIC:-false}" = "true" ] || { err "TUIC 协议未启用"; return 1; }
-    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
-    new_port="${new_port:-$TUIC_PORT}"
+    read_tuic_list || return 1
+    [ "$TUIC_COUNT" -gt 0 ] || { err "TUIC 协议未启用"; return 1; }
+    target_tag=$(select_tag_from_list "当前 TUIC 列表：" "${TUIC_TAGS[@]}") || return 1
+    current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    read -p "输入新的 TUIC 端口(回车保持 ${current_port}): " new_port
+    new_port="${new_port:-$current_port}"
     backup_config
-    jq --argjson port "$new_port" '.inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
 }
 
 action_add_tuic() {
     read_config || return 1
-    [ "${ENABLE_TUIC:-false}" != "true" ] || { warn "TUIC 已存在"; return 0; }
     read -p "输入 TUIC 端口(留空随机 10000-60000): " new_port
     read -p "输入 TUIC UUID(留空自动生成): " new_uuid
     read -p "输入 TUIC 密码(留空自动生成): " new_psk
     new_port="${new_port:-$(rand_port)}"
     new_uuid="${new_uuid:-$(rand_uuid)}"
     new_psk="${new_psk:-$(rand_pass)}"
-    inbound=$(jq -nc --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    new_tag=$(next_protocol_tag "tuic-in")
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_TUIC true
@@ -1504,13 +1627,15 @@ action_add_tuic() {
 }
 
 action_delete_tuic() {
-    read_config || return 1
-    [ "${ENABLE_TUIC:-false}" = "true" ] || { warn "TUIC 未启用"; return 0; }
-    read -p "确认删除 TUIC 协议? [y/N]: " confirm
+    read_tuic_list || return 1
+    [ "$TUIC_COUNT" -gt 0 ] || { warn "TUIC 未启用"; return 0; }
+    target_tag=$(select_tag_from_list "当前 TUIC 列表：" "${TUIC_TAGS[@]}") || return 1
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
     case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
     backup_config
-    jq_remove_by_tag "tuic-in"
-    set_protocol_flag ENABLE_TUIC false
+    jq_remove_by_tag "$target_tag"
+    read_tuic_list || true
+    [ "${TUIC_COUNT:-0}" -gt 0 ] && set_protocol_flag ENABLE_TUIC true || set_protocol_flag ENABLE_TUIC false
     validate_and_restart
 }
 
@@ -1587,18 +1712,19 @@ action_reset_reality() {
 }
 
 action_reset_anytls() {
-    read_config || return 1
-    [ "${ENABLE_ANYTLS:-false}" = "true" ] || { err "AnyTLS Reality 协议未启用"; return 1; }
-    read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
-    new_port="${new_port:-$ANYTLS_PORT}"
+    read_anytls_list || return 1
+    [ "$ANYTLS_COUNT" -gt 0 ] || { err "AnyTLS Reality 协议未启用"; return 1; }
+    target_tag=$(select_tag_from_list "当前 AnyTLS 列表：" "${ANYTLS_TAGS[@]}") || return 1
+    current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    read -p "输入新的 AnyTLS Reality 端口(回车保持 ${current_port}): " new_port
+    new_port="${new_port:-$current_port}"
     backup_config
-    jq --argjson port "$new_port" '.inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
 }
 
 action_add_anytls() {
     read_config || return 1
-    [ "${ENABLE_ANYTLS:-false}" != "true" ] || { warn "AnyTLS 已存在"; return 0; }
     read -p "输入 AnyTLS 端口(留空随机 10000-60000): " new_port
     read -p "输入 AnyTLS 用户名(默认 anytls): " new_user
     read -p "输入 AnyTLS 密码(留空自动生成): " new_psk
@@ -1606,23 +1732,26 @@ action_add_anytls() {
     new_user="${new_user:-anytls}"
     new_psk="${new_psk:-$(rand_pass)}"
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
-    REALITY_SID="${REALITY_SID:-$(rand_sid)}"
     [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增 AnyTLS"; return 1; }
+    new_sid="$(rand_sid)"
+    new_tag=$(next_protocol_tag "anytls-in")
     backup_config
-    inbound=$(jq -nc --argjson port "$new_port" --arg user "$new_user" --arg psk "$new_psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg psk "$new_psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$new_sid" '{type:"anytls",tag:$tag,listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_ANYTLS true
     validate_and_restart
 }
 
 action_delete_anytls() {
-    read_config || return 1
-    [ "${ENABLE_ANYTLS:-false}" = "true" ] || { warn "AnyTLS 未启用"; return 0; }
-    read -p "确认删除 AnyTLS 协议? [y/N]: " confirm
+    read_anytls_list || return 1
+    [ "$ANYTLS_COUNT" -gt 0 ] || { warn "AnyTLS 未启用"; return 0; }
+    target_tag=$(select_tag_from_list "当前 AnyTLS 列表：" "${ANYTLS_TAGS[@]}") || return 1
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
     case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
     backup_config
-    jq_remove_by_tag "anytls-in"
-    set_protocol_flag ENABLE_ANYTLS false
+    jq_remove_by_tag "$target_tag"
+    read_anytls_list || true
+    [ "${ANYTLS_COUNT:-0}" -gt 0 ] && set_protocol_flag ENABLE_ANYTLS true || set_protocol_flag ENABLE_ANYTLS false
     validate_and_restart
 }
 
