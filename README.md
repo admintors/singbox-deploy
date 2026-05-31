@@ -1,243 +1,260 @@
 # singbox-deploy
-一个跨平台、自动化、全兼容的 Sing-box 一键部署脚本
-## 功能说明
 
-本脚本用于安装和管理 sing-box，支持以下协议：
-
-- Shadowsocks
-- Hysteria2
-- TUIC
-- VLESS Reality
-- AnyTLS Reality
-
-支持以下管理能力：
-
-- 查看 URI
-- 重新生成 URI
-- 查看配置文件路径
-- 编辑配置文件
-- 查看服务状态
-- 更新 sing-box
-- 卸载 sing-box
+一个用于 **Sing-box 服务端安装、管理、卸载** 的一键脚本仓库。  
+支持 **SS / HY2 / TUIC / VLESS Reality / AnyTLS** 协议部署，支持 **VLESS Reality 多实例管理**，并支持 **指定哪些 VLESS Reality 走上游 Shadowsocks 中转**。
 
 ---
 
-## 协议管理
+## 功能特点
 
-支持对以下协议进行管理：
-
-- SS：新增 / 删除 / 修改端口
-- HY2：新增 / 删除 / 修改端口
-- TUIC：新增 / 删除 / 修改端口
-- AnyTLS：新增 / 删除 / 修改端口
-
----
-
-## VLESS Reality 管理
-
-支持对 VLESS Reality 节点进行管理：
-
-- 查看 Reality 列表
-- 新增一个 Reality
-- 删除一个 Reality
-- 修改指定 Reality 的端口
-
-首次安装时默认创建 1 个 VLESS Reality 节点。  
-后续可通过管理面板继续新增多个 Reality 节点。
+- 支持 Alpine / Debian / Ubuntu 等常见 Linux 系统
+- 支持安装 Sing-box 最新服务端
+- 支持生成客户端连接 URI
+- 支持 `sb` 管理面板
+- 支持 VLESS Reality 多实例新增 / 删除 / 改端口 / 列表查看
+- 支持 SS / HY2 / TUIC / AnyTLS 的新增 / 删除 / 改端口
+- 支持中转模式
+- 支持指定哪些 `vless-in-*` 走上游 Shadowsocks 中转
+- 支持重新应用中转配置
+- 支持一键彻底卸载
 
 ---
 
-## 中转功能
+## 仓库文件说明
 
-脚本支持将指定的 VLESS Reality 节点通过上游 Shadowsocks 进行中转。
-
-### 支持的部署方式
-
-- 直连落地
-- 通过上游 Shadowsocks 中转指定 VLESS
-
-### 中转模式说明
-
-当启用中转模式后，可以为当前服务器配置一个上游 Shadowsocks 节点，并指定哪些 VLESS Reality 节点走该上游中转。
-
-例如：
-
-- `vless-in-1` 走上游 SS 中转
-- `vless-in-2` 保持本机直连
-- `vless-in-3` 也走上游 SS 中转
-
-也就是说：
-
-- 中转规则支持精确绑定到指定 `vless-in-*`
-- 不会默认把所有 VLESS 节点都强制中转
-- 未被选中的 VLESS 节点仍然保持本机直连
-- SS / HY2 / TUIC / AnyTLS 默认不受该中转规则影响
-
-### 中转管理功能
-
-管理面板中支持：
-
-- 查看当前中转状态
-- 配置上游 SS 参数
-- 选择哪些 VLESS 走中转
-- 关闭中转模式
-- 重新应用中转配置
-
-### 中转参数包括
-
-- 上游 SS 服务器地址
-- 上游 SS 端口
-- 上游 SS 加密方式
-- 上游 SS 密码
+- `run.sh`：一键安装入口脚本
+- `install-singbox-yyds.sh`：主安装 / 管理脚本
+- `uninstall-singbox-yyds.sh`：一键卸载脚本
 
 ---
 
-## 安装
+## 一键安装
 
-使用以下命令一键运行安装脚本：
+### 方式 1：直接运行 `run.sh`
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/run.sh)"
 ```
 
-如果已经将仓库下载到本地，也可以直接运行：
+---
+
+### 方式 2：直接运行主安装脚本
 
 ```bash
-chmod +x run.sh
-bash run.sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/install-singbox-yyds.sh)"
 ```
 
 ---
 
-## 运行要求
+## 安装后如何管理
 
-请使用 `root` 权限执行脚本。
-
-支持系统：
-
-- Alpine
-- Debian
-- Ubuntu
-
----
-
-## 安装完成后
-
-安装完成后，可使用以下命令打开管理面板：
+安装完成后，输入：
 
 ```bash
 sb
 ```
+
+进入管理面板。
 
 ---
 
 ## 管理面板结构
 
-### 1) 链接与配置
-- 查看 URI
-- 重新生成 URI
-- 查看配置文件路径
-- 编辑配置文件
+主菜单：
 
-### 2) 协议管理
-- SS 管理
-- HY2 管理
-- TUIC 管理
-- AnyTLS 管理
-
-### 3) VLESS Reality 管理
-- 查看 Reality 列表
-- 新增一个 Reality
-- 删除一个 Reality
-- 修改 Reality 端口
-
-### 4) 中转管理
-- 查看当前中转状态
-- 配置上游 SS 参数
-- 选择哪些 VLESS 走中转
-- 关闭中转模式
-- 重新应用中转配置
-
-### 5) 服务管理
-- 查看服务状态
-- 更新 sing-box
-- 卸载 sing-box
+```text
+1) 链接与配置
+2) 协议管理
+3) VLESS Reality 管理
+4) 中转管理
+5) 服务管理
+0) 退出
+```
 
 ---
 
-## 常用命令
+## 协议管理
 
-### 打开管理面板
-```bash
-sb
+在 `协议管理` 中可管理：
+
+- SS
+- HY2
+- TUIC
+- AnyTLS
+
+每类协议都支持：
+
+- 新增
+- 删除
+- 修改端口
+
+---
+
+## VLESS Reality 管理
+
+在 `VLESS Reality 管理` 中支持：
+
+- 查看 Reality 列表
+- 新增一个 Reality
+- 删除一个 Reality
+- 修改指定 Reality 的端口
+- 重新生成 URI
+
+VLESS Reality 使用类似以下 tag：
+
+```text
+vless-in-1
+vless-in-2
+vless-in-3
 ```
 
-### 查看生成的链接
-```bash
-cat /etc/sing-box/uris.txt
+旧版单节点 `vless-in` 会自动迁移到：
+
+```text
+vless-in-1
 ```
 
-### 查看配置文件
-```bash
-cat /etc/sing-box/config.json
+---
+
+## 中转模式
+
+脚本支持两种部署模式：
+
+```text
+1) 直连落地（默认）
+2) 通过上游 Shadowsocks 中转指定 VLESS
 ```
 
-### 检查配置文件
-```bash
-sing-box check -c /etc/sing-box/config.json
-```
+如果启用中转模式，可以在 `中转管理` 中：
+
+- 查看当前中转状态
+- 修改上游 Shadowsocks 参数
+- 选择哪些 `vless-in-*` 走中转
+- 关闭中转模式
+- 重新应用中转配置
+
+说明：
+
+- 不会默认让所有协议都走中转
+- 只会让你指定的 `vless-in-*` 走上游 SS
+- 其他 VLESS / 其他协议仍然保持直连
+
+---
+
+## 链接与配置
+
+在 `链接与配置` 中可以：
+
+- 查看客户端 URI
+- 查看配置文件位置
+- 手动编辑配置
+- 重新生成链接
 
 ---
 
 ## 服务管理
 
-### Debian / Ubuntu
+在 `服务管理` 中可以：
 
-重启服务：
+- 启动服务
+- 停止服务
+- 重启服务
+- 查看服务状态
+- 查看运行日志
+- 更新 sing-box
+
+---
+
+## 一键卸载
+
+### 交互确认版
 
 ```bash
-systemctl restart sing-box
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/uninstall-singbox-yyds.sh)"
 ```
 
-查看状态：
+运行后会要求输入：
 
-```bash
-systemctl status sing-box
+```text
+YES
 ```
 
-### Alpine
+确认后才会继续卸载。
 
-重启服务：
+---
+
+### 无确认直接卸载版
 
 ```bash
-rc-service sing-box restart
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/uninstall-singbox-yyds.sh)" --yes
 ```
 
-查看状态：
+如果上面这种 shell 传参方式在你的环境不方便，也可以这样：
 
 ```bash
-rc-service sing-box status
+curl -fsSL -o uninstall-singbox-yyds.sh https://raw.githubusercontent.com/admintors/singbox-deploy/main/uninstall-singbox-yyds.sh && chmod +x uninstall-singbox-yyds.sh && ./uninstall-singbox-yyds.sh --yes
 ```
 
 ---
 
-## 文件路径
+## 卸载会删除什么
 
-主配置文件：
+卸载脚本会尝试移除：
+
+- `/etc/sing-box`
+- `/usr/local/bin/sb`
+- `/usr/local/bin/install-singbox-yyds.sh`
+- `/usr/local/bin/run.sh`
+- `sing-box` service 文件
+- `sing-box` 二进制程序
+- 相关残留进程
+
+适用于：
+
+- 想彻底清理旧配置重新安装
+- 想从零开始重新部署
+- 想移除旧版脚本残留
+
+---
+
+## 适用场景
+
+适合以下用途：
+
+- 新服务器快速部署 sing-box
+- 一台机器部署多个 VLESS Reality
+- 使用部分 VLESS Reality 走上游 Shadowsocks 中转
+- 需要通过菜单管理协议和端口
+- 需要彻底卸载后重新安装
+
+---
+
+## 常用命令
+
+安装：
 
 ```bash
-/etc/sing-box/config.json
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/run.sh)"
 ```
 
-URI 文件：
+进入面板：
 
 ```bash
-/etc/sing-box/uris.txt
+sb
 ```
 
-管理命令：
+卸载：
 
 ```bash
-/usr/local/bin/sb
+curl -fsSL -o uninstall-singbox-yyds.sh https://raw.githubusercontent.com/admintors/singbox-deploy/main/uninstall-singbox-yyds.sh && chmod +x uninstall-singbox-yyds.sh && ./uninstall-singbox-yyds.sh --yes
 ```
 
+---
+
+## 说明
+
+如果你是从旧版脚本升级：
+
+- 旧版 `vless-in` 会自动迁移到 `vless-in-1`
+- 旧配置缓存会在运行时自动检查并兼容迁移
+- 如果历史配置过于混乱，建议先执行卸载脚本后再全新安装
