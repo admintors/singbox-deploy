@@ -1163,6 +1163,17 @@ set_protocol_flag() {
         *) err "未知协议标志: $key"; return 1 ;;
     esac
     save_protocol_flags
+
+    if [ -f "$CACHE_FILE" ]; then
+        awk -F= -v k="$key" -v v="$val" '
+        BEGIN{done=0}
+        $1==k {print k"="v; done=1; next}
+        {print}
+        END{if(!done) print k"="v}
+        ' "$CACHE_FILE" > "${CACHE_FILE}.tmp" && mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
+    else
+        echo "$key=$val" > "$CACHE_FILE"
+    fi
 }
 
 backup_config() { cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"; }
