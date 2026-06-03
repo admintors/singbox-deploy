@@ -129,8 +129,9 @@ select_protocols() {
     echo "3) TUIC"
     echo "4) VLESS Reality"
     echo "5) AnyTLS Reality"
+    echo "6) SOCKS5"
     echo ""
-    echo "请输入要部署的协议编号(多个用空格分隔,如: 1 2 4):"
+    echo "请输入要部署的协议编号(多个用空格分隔,如: 1 2 4 6):"
     read -r protocol_input
     
     # 使用全局变量
@@ -139,6 +140,7 @@ select_protocols() {
     ENABLE_TUIC=false
     ENABLE_REALITY=false
     ENABLE_ANYTLS=false
+    ENABLE_SOCKS=false
     
     for num in $protocol_input; do
         case "$num" in
@@ -147,11 +149,12 @@ select_protocols() {
             3) ENABLE_TUIC=true ;;
             4) ENABLE_REALITY=true ;;
             5) ENABLE_ANYTLS=true ;;
+            6) ENABLE_SOCKS=true ;;
             *) warn "无效选项: $num" ;;
         esac
     done
     
-    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
+    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS && ! $ENABLE_SOCKS; then
         err "未选择任何协议,退出安装"
         exit 1
     fi
@@ -164,6 +167,7 @@ ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
 ENABLE_ANYTLS=$ENABLE_ANYTLS
+ENABLE_SOCKS=$ENABLE_SOCKS
 EOF
     
     info "已选择协议:"
@@ -172,6 +176,7 @@ EOF
     $ENABLE_TUIC && echo "  - TUIC"
     $ENABLE_REALITY && echo "  - VLESS Reality"
     $ENABLE_ANYTLS && echo "  - AnyTLS Reality"
+    $ENABLE_SOCKS && echo "  - SOCKS5"
     
     # 导出为全局变量（确保后续脚本可以访问）
     export ENABLE_SS
@@ -179,6 +184,7 @@ EOF
     export ENABLE_TUIC
     export ENABLE_REALITY
     export ENABLE_ANYTLS
+    export ENABLE_SOCKS
 }
 
 # 创建配置目录
@@ -411,6 +417,23 @@ get_config() {
     info "AnyTLS Reality 端口: $PORT_ANYTLS"
     info "AnyTLS Reality 用户名: $ANYTLS_USER"
     info "AnyTLS Reality 密码已自动生成"
+    fi
+
+    if $ENABLE_SOCKS; then
+        info "=== 配置 SOCKS5 ==="
+        if [ -n "${SINGBOX_PORT_SOCKS:-}" ]; then
+            PORT_SOCKS="$SINGBOX_PORT_SOCKS"
+        else
+            read -p "请输入 SOCKS5 端口(留空则随机 10000-60000): " USER_PORT_SOCKS
+            PORT_SOCKS="${USER_PORT_SOCKS:-$(rand_port)}"
+        fi
+        read -p "请输入 SOCKS5 用户名(留空自动生成): " USER_SOCKS_USERNAME
+        read -p "请输入 SOCKS5 密码(留空自动生成): " USER_SOCKS_PASSWORD
+        SOCKS_USERNAME="${USER_SOCKS_USERNAME:-socks$(openssl rand -hex 2)}"
+        SOCKS_PASSWORD="${USER_SOCKS_PASSWORD:-$(rand_pass)}"
+        info "SOCKS5 端口: $PORT_SOCKS"
+        info "SOCKS5 用户名: $SOCKS_USERNAME"
+        info "SOCKS5 密码已设置"
     fi
 
     info "配置完成，继续安装..."
@@ -699,6 +722,28 @@ INBOUND_ANYTLS
     sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
 
     need_comma=true
+    fi
+
+    if $ENABLE_SOCKS; then
+        $need_comma && echo "," >> "$TEMP_INBOUNDS"
+        cat >> "$TEMP_INBOUNDS" <<'INBOUND_SOCKS'
+    {
+      "type": "socks",
+      "tag": "socks-in-1",
+      "listen": "::",
+      "listen_port": PORT_SOCKS_PLACEHOLDER,
+      "users": [
+        {
+          "username": "SOCKS_USERNAME_PLACEHOLDER",
+          "password": "SOCKS_PASSWORD_PLACEHOLDER"
+        }
+      ]
+    }
+INBOUND_SOCKS
+        sed -i "s|PORT_SOCKS_PLACEHOLDER|$PORT_SOCKS|g" "$TEMP_INBOUNDS"
+        sed -i "s|SOCKS_USERNAME_PLACEHOLDER|$SOCKS_USERNAME|g" "$TEMP_INBOUNDS"
+        sed -i "s|SOCKS_PASSWORD_PLACEHOLDER|$SOCKS_PASSWORD|g" "$TEMP_INBOUNDS"
+        need_comma=true
     fi
 
     # 生成最终配置
@@ -1010,6 +1055,15 @@ generate_uris() {
         echo "anytls://${anytls_pass_encoded}@${host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
         echo ""
     fi
+
+    if $ENABLE_SOCKS; then
+        socks_user_encoded=$(printf "%s" "$SOCKS_USERNAME" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
+        socks_pass_encoded=$(printf "%s" "$SOCKS_PASSWORD" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
+        echo "=== SOCKS5 ==="
+        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${host}:${PORT_SOCKS}#socks${suffix}"
+        echo "${host}:${PORT_SOCKS} 用户名=${SOCKS_USERNAME} 密码=${SOCKS_PASSWORD}"
+        echo ""
+    fi
 }
 
 # -----------------------
@@ -1025,6 +1079,7 @@ $ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
 $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
+$ENABLE_SOCKS && echo "   SOCKS5 端口: $PORT_SOCKS | 用户: $SOCKS_USERNAME | 密码: $SOCKS_PASSWORD"
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
 echo ""
@@ -1143,6 +1198,7 @@ load_protocol_flags() {
     ENABLE_TUIC=false
     ENABLE_REALITY=false
     ENABLE_ANYTLS=false
+    ENABLE_SOCKS=false
     INSTALL_MODE="direct"
     UPSTREAM_SS_SERVER=""
     UPSTREAM_SS_PORT=""
@@ -1160,6 +1216,7 @@ ENABLE_HY2=${ENABLE_HY2:-false}
 ENABLE_TUIC=${ENABLE_TUIC:-false}
 ENABLE_REALITY=${ENABLE_REALITY:-false}
 ENABLE_ANYTLS=${ENABLE_ANYTLS:-false}
+ENABLE_SOCKS=${ENABLE_SOCKS:-false}
 EOF
 }
 
@@ -1172,6 +1229,7 @@ set_protocol_flag() {
         ENABLE_TUIC) ENABLE_TUIC="$val" ;;
         ENABLE_REALITY) ENABLE_REALITY="$val" ;;
         ENABLE_ANYTLS) ENABLE_ANYTLS="$val" ;;
+        ENABLE_SOCKS) ENABLE_SOCKS="$val" ;;
         *) err "未知协议标志: $key"; return 1 ;;
     esac
     save_protocol_flags
@@ -1271,6 +1329,12 @@ read_config() {
         ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
         ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
     fi
+
+    if [ "${ENABLE_SOCKS:-false}" = "true" ]; then
+        SOCKS_PORT=$(jq -r '.inbounds[] | select(.type=="socks") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        SOCKS_USERNAME=$(jq -r '.inbounds[] | select(.type=="socks") | .users[0].username // empty' "$CONFIG_PATH" | head -n1)
+        SOCKS_PASSWORD=$(jq -r '.inbounds[] | select(.type=="socks") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+    fi
 }
 
 read_reality_list() {
@@ -1345,6 +1409,19 @@ read_anytls_list() {
     mapfile -t ANYTLS_PSKS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH")
     mapfile -t ANYTLS_SIDS < <(jq -r '.inbounds[]? | select(.type=="anytls") | .tls.reality.short_id[0] // empty' "$CONFIG_PATH")
     ANYTLS_COUNT="${#ANYTLS_TAGS[@]}"
+}
+
+read_socks_list() {
+    need_config || return 1
+    SOCKS_TAGS=()
+    SOCKS_PORTS=()
+    SOCKS_USERS=()
+    SOCKS_PASSWORDS=()
+    mapfile -t SOCKS_TAGS < <(jq -r '.inbounds[]? | select(.type=="socks") | .tag // empty' "$CONFIG_PATH")
+    mapfile -t SOCKS_PORTS < <(jq -r '.inbounds[]? | select(.type=="socks") | .listen_port // empty' "$CONFIG_PATH")
+    mapfile -t SOCKS_USERS < <(jq -r '.inbounds[]? | select(.type=="socks") | .users[0].username // empty' "$CONFIG_PATH")
+    mapfile -t SOCKS_PASSWORDS < <(jq -r '.inbounds[]? | select(.type=="socks") | .users[0].password // empty' "$CONFIG_PATH")
+    SOCKS_COUNT="${#SOCKS_TAGS[@]}"
 }
 
 next_protocol_tag() {
@@ -1449,6 +1526,18 @@ generate_uris() {
         for ((i=0; i<ANYTLS_COUNT; i++)); do
             anytls_encoded=$(url_encode "${ANYTLS_PSKS[$i]}")
             echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+        done
+        echo >> "$URI_FILE"
+    fi
+
+    read_socks_list || return 1
+    if [ "$SOCKS_COUNT" -gt 0 ]; then
+        echo "=== SOCKS5 ===" >> "$URI_FILE"
+        for ((i=0; i<SOCKS_COUNT; i++)); do
+            socks_user_encoded=$(url_encode "${SOCKS_USERS[$i]}")
+            socks_pass_encoded=$(url_encode "${SOCKS_PASSWORDS[$i]}")
+            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${PUBLIC_IP}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "${SOCKS_TAGS[$i]} => ${PUBLIC_IP}:${SOCKS_PORTS[$i]} 用户名=${SOCKS_USERS[$i]} 密码=${SOCKS_PASSWORDS[$i]}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1723,6 +1812,53 @@ action_reset_anytls() {
     validate_and_restart
 }
 
+action_reset_socks() {
+    read_socks_list || return 1
+    [ "$SOCKS_COUNT" -gt 0 ] || { err "SOCKS5 协议未启用"; return 1; }
+    target_tag=$(select_tag_from_list "当前 SOCKS5 列表：" "${SOCKS_TAGS[@]}") || return 1
+    current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    current_user=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .users[0].username // empty' "$CONFIG_PATH" | head -n1)
+    current_pass=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+    read -p "输入新的 SOCKS5 端口(回车保持 ${current_port}): " new_port
+    read -p "输入新的 SOCKS5 用户名(回车保持 ${current_user}): " new_user
+    read -p "输入新的 SOCKS5 密码(回车保持当前): " new_pass
+    new_port="${new_port:-$current_port}"
+    new_user="${new_user:-$current_user}"
+    new_pass="${new_pass:-$current_pass}"
+    backup_config
+    jq --arg tag "$target_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '.inbounds |= map(if .tag==$tag then .listen_port = $port | .users[0].username = $user | .users[0].password = $pass else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    validate_and_restart
+}
+
+action_add_socks() {
+    read_config || return 1
+    read -p "输入 SOCKS5 端口(留空随机 10000-60000): " new_port
+    read -p "输入 SOCKS5 用户名(留空自动生成): " new_user
+    read -p "输入 SOCKS5 密码(留空自动生成): " new_pass
+    new_port="${new_port:-$(rand_port)}"
+    new_user="${new_user:-socks$(openssl rand -hex 2)}"
+    new_pass="${new_pass:-$(rand_pass)}"
+    new_tag=$(next_protocol_tag "socks-in")
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '{type:"socks",tag:$tag,listen:"::",listen_port:$port,users:[{username:$user,password:$pass}]}' )
+    backup_config
+    jq_add_inbound "$inbound"
+    set_protocol_flag ENABLE_SOCKS true
+    validate_and_restart
+}
+
+action_delete_socks() {
+    read_socks_list || return 1
+    [ "$SOCKS_COUNT" -gt 0 ] || { warn "SOCKS5 未启用"; return 0; }
+    target_tag=$(select_tag_from_list "当前 SOCKS5 列表：" "${SOCKS_TAGS[@]}") || return 1
+    read -p "确认删除 ${target_tag} ? [y/N]: " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) warn "已取消删除"; return 0 ;; esac
+    backup_config
+    jq_remove_by_tag "$target_tag"
+    read_socks_list || true
+    [ "${SOCKS_COUNT:-0}" -gt 0 ] && set_protocol_flag ENABLE_SOCKS true || set_protocol_flag ENABLE_SOCKS false
+    validate_and_restart
+}
+
 action_add_anytls() {
     read_config || return 1
     read -p "输入 AnyTLS 端口(留空随机 10000-60000): " new_port
@@ -1966,6 +2102,7 @@ menu_protocols() {
         echo "2) HY2 管理"
         echo "3) TUIC 管理"
         echo "4) AnyTLS 管理"
+        echo "5) SOCKS5 管理"
         echo "0) 返回上一级"
         echo "--------------------------------"
         read -p "请输入选项: " proto_menu
@@ -1974,6 +2111,7 @@ menu_protocols() {
             2) menu_hy2 ;;
             3) menu_tuic ;;
             4) menu_anytls ;;
+            5) menu_socks ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入" ;;
         esac
@@ -2034,6 +2172,26 @@ menu_tuic() {
             1) action_add_tuic ;;
             2) action_delete_tuic ;;
             3) action_reset_tuic ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入" ;;
+        esac
+    done
+}
+
+menu_socks() {
+    while true; do
+        echo
+        echo "----------- SOCKS5 管理 -----------"
+        echo "1) 新增 SOCKS5"
+        echo "2) 删除 SOCKS5"
+        echo "3) 修改 SOCKS5 端口/账号"
+        echo "0) 返回上一级"
+        echo "-----------------------------------"
+        read -p "请输入选项: " subopt
+        case "$subopt" in
+            1) action_add_socks ;;
+            2) action_delete_socks ;;
+            3) action_reset_socks ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入" ;;
         esac
