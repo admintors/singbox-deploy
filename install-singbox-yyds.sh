@@ -985,18 +985,34 @@ setup_service
 get_public_ip() {
     local ip=""
     for url in \
+        "https://api4.ipify.org" \
+        "https://api64.ipify.org" \
         "https://api.ipify.org" \
+        "https://ident.me" \
         "https://ipinfo.io/ip" \
         "https://ifconfig.me" \
         "https://icanhazip.com" \
-        "https://ipecho.net/plain"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        "https://ipecho.net/plain" \
+        "https://api6.ipify.org" \
+        "https://v6.ident.me"; do
+        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ip" ]; then
             echo "$ip"
             return 0
         fi
     done
     return 1
+}
+
+format_host_for_uri() {
+    local host="$1"
+    if [[ "$host" == \[*\] ]]; then
+        echo "$host"
+    elif [[ "$host" == *:* ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
 }
 
 # 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
@@ -1016,6 +1032,8 @@ fi
 # 生成链接(仅生成已选择的协议)
 generate_uris() {
     local host="$PUB_IP"
+    local uri_host
+    uri_host=$(format_host_for_uri "$host")
     
     if $ENABLE_SS; then
         local ss_userinfo="${SS_METHOD}:${PSK_SS}"
@@ -1023,28 +1041,28 @@ generate_uris() {
         ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
 
         echo "=== Shadowsocks (SS) ==="
-        echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
-        echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_encoded}@${uri_host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_b64}@${uri_host}:${PORT_SS}#ss${suffix}"
         echo ""
     fi
     
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        echo "hy2://${hy2_encoded}@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
         echo ""
     fi
 
     if $ENABLE_TUIC; then
         tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== TUIC ==="
-        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
+        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
         echo ""
     fi
     
     if $ENABLE_REALITY; then
         echo "=== VLESS Reality ==="
-        echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
+        echo "vless://${UUID}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
         echo ""
     fi
 
@@ -1052,7 +1070,7 @@ generate_uris() {
         anytls_user_encoded=$(printf "%s" "$ANYTLS_USER" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         anytls_pass_encoded=$(printf "%s" "$ANYTLS_PSK" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== AnyTLS Reality ==="
-        echo "anytls://${anytls_pass_encoded}@${host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
+        echo "anytls://${anytls_pass_encoded}@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
         echo ""
     fi
 
@@ -1060,7 +1078,7 @@ generate_uris() {
         socks_user_encoded=$(printf "%s" "$SOCKS_USERNAME" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         socks_pass_encoded=$(printf "%s" "$SOCKS_PASSWORD" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== SOCKS5 ==="
-        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${host}:${PORT_SOCKS}#socks${suffix}"
+        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${uri_host}:${PORT_SOCKS}#socks${suffix}"
         echo "${host}:${PORT_SOCKS} 用户名=${SOCKS_USERNAME} 密码=${SOCKS_PASSWORD}"
         echo ""
     fi
@@ -1463,16 +1481,36 @@ select_tag_from_list() {
 
 get_public_ip() {
     local ip=""
-    for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+    for url in \
+        "https://api4.ipify.org" \
+        "https://api64.ipify.org" \
+        "https://api.ipify.org" \
+        "https://ident.me" \
+        "https://ipinfo.io/ip" \
+        "https://ifconfig.me" \
+        "https://api6.ipify.org" \
+        "https://v6.ident.me"; do
+        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
         [ -n "$ip" ] && echo "$ip" && return 0
     done
     echo "YOUR_SERVER_IP"
 }
 
+format_host_for_uri() {
+    local host="$1"
+    if [[ "$host" == \[*\] ]]; then
+        echo "$host"
+    elif [[ "$host" == *:* ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
+}
+
 generate_uris() {
     read_config || return 1
     if [ -n "${CUSTOM_IP:-}" ]; then PUBLIC_IP="$CUSTOM_IP"; else PUBLIC_IP=$(get_public_ip); fi
+    URI_HOST=$(format_host_for_uri "$PUBLIC_IP")
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     : > "$URI_FILE"
 
@@ -1483,8 +1521,8 @@ generate_uris() {
             ss_userinfo="${SS_METHODS[$i]}:${SS_PSKS[$i]}"
             ss_encoded=$(url_encode "$ss_userinfo")
             ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-            echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
-            echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_encoded}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_b64}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1494,7 +1532,7 @@ generate_uris() {
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
         for ((i=0; i<HY2_COUNT; i++)); do
             hy2_encoded=$(url_encode "${HY2_PSKS[$i]}")
-            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "hy2://${hy2_encoded}@${URI_HOST}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1504,7 +1542,7 @@ generate_uris() {
         echo "=== TUIC ===" >> "$URI_FILE"
         for ((i=0; i<TUIC_COUNT; i++)); do
             tuic_encoded=$(url_encode "${TUIC_PSKS[$i]}")
-            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${URI_HOST}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1514,7 +1552,7 @@ generate_uris() {
         if [ "$REALITY_COUNT" -gt 0 ]; then
             echo "=== VLESS Reality ===" >> "$URI_FILE"
             for ((i=0; i<REALITY_COUNT; i++)); do
-                echo "vless://${REALITY_UUIDS[$i]}@${PUBLIC_IP}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+                echo "vless://${REALITY_UUIDS[$i]}@${URI_HOST}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             done
             echo >> "$URI_FILE"
         fi
@@ -1525,7 +1563,7 @@ generate_uris() {
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
         for ((i=0; i<ANYTLS_COUNT; i++)); do
             anytls_encoded=$(url_encode "${ANYTLS_PSKS[$i]}")
-            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${URI_HOST}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1536,7 +1574,7 @@ generate_uris() {
         for ((i=0; i<SOCKS_COUNT; i++)); do
             socks_user_encoded=$(url_encode "${SOCKS_USERS[$i]}")
             socks_pass_encoded=$(url_encode "${SOCKS_PASSWORDS[$i]}")
-            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${PUBLIC_IP}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${URI_HOST}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             echo "${SOCKS_TAGS[$i]} => ${PUBLIC_IP}:${SOCKS_PORTS[$i]} 用户名=${SOCKS_USERS[$i]} 密码=${SOCKS_PASSWORDS[$i]}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
