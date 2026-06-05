@@ -17,6 +17,7 @@
 - 支持指定哪些 `vless-in-*` 走上游 Shadowsocks 中转
 - 支持重新应用中转配置
 - 支持一键彻底卸载
+- 支持基础 IPv6 链接生成与 IPv6 地址格式兼容
 
 ---
 
@@ -25,6 +26,8 @@
 - `run.sh`：一键安装入口脚本
 - `install-singbox-yyds.sh`：主安装 / 管理脚本
 - `uninstall-singbox-yyds.sh`：一键卸载脚本
+- `README.md`：常规说明文档
+- `README-BEGINNER.md`：小白版使用说明
 
 ---
 
@@ -35,8 +38,6 @@
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/admintors/singbox-deploy/main/run.sh)"
 ```
-
----
 
 ### 方式 2：直接运行主安装脚本
 
@@ -165,6 +166,22 @@ vless-in-1
 
 ---
 
+## IPv6 说明
+
+当前脚本已支持基础 IPv6 使用场景：
+
+- 自动探测公网地址时可识别 IPv6
+- 生成 URI 时可正确处理 IPv6 字面量地址格式
+- 手动输入 IPv6 地址时，会按 URI 规范自动兼容
+
+注意：
+
+- 请自行确认服务器具备公网 IPv6
+- 请自行确认云平台安全组 / 防火墙已放行 IPv6 入站
+- 若使用域名，建议优先使用域名而不是直接暴露裸 IPv6 地址
+
+---
+
 ## 一键卸载
 
 ### 交互确认版
@@ -180,8 +197,6 @@ YES
 ```
 
 确认后才会继续卸载。
-
----
 
 ### 无确认直接卸载版
 
@@ -248,6 +263,14 @@ sb
 ```bash
 curl -fsSL -o uninstall-singbox-yyds.sh https://raw.githubusercontent.com/admintors/singbox-deploy/main/uninstall-singbox-yyds.sh && chmod +x uninstall-singbox-yyds.sh && ./uninstall-singbox-yyds.sh --yes
 ```
+
+---
+
+## 给新手用户
+
+如果你希望给完全不会操作的新手看，请直接阅读：
+
+- [`README-BEGINNER.md`](./README-BEGINNER.md)
 
 ---
 
