@@ -46,68 +46,114 @@ check_root() {
 check_root
 
 # -----------------------
-# 安装依赖
-install_deps() {
-    info "安装系统依赖..."
-    
+# 安装依赖（低内存友好：仅确保下载器存在，jq 按需安装）
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+APT_UPDATED=0
+
+apt_update_once() {
+    case "$OS" in
+        debian)
+            if [ "${APT_UPDATED:-0}" -eq 0 ]; then
+                apt-get update -y || { err "apt update 失败"; return 1; }
+                APT_UPDATED=1
+            fi
+            ;;
+    esac
+}
+
+fetch() {
+    local url="$1"
+    if has_cmd curl; then
+        curl -fsSL --connect-timeout 5 "$url"
+    elif has_cmd wget; then
+        wget -qO- --timeout=5 "$url"
+    else
+        return 127
+    fi
+}
+
+ensure_fetcher() {
+    if has_cmd curl || has_cmd wget; then
+        return 0
+    fi
+
     case "$OS" in
         alpine)
             apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
-                err "依赖安装失败"
+            apk add --no-cache wget || {
+                err "下载器安装失败"
                 exit 1
             }
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq || {
-                err "依赖安装失败"
+            apt_update_once || exit 1
+            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 wget || {
+                err "下载器安装失败"
                 exit 1
             }
             ;;
         redhat)
-            yum install -y curl ca-certificates openssl jq || {
-                err "依赖安装失败"
+            yum install -y wget || {
+                err "下载器安装失败"
                 exit 1
             }
+            ;;
+        *)
+            err "未识别的系统类型，且未找到 curl/wget"
+            exit 1
+            ;;
+    esac
+}
+
+ensure_jq() {
+    has_cmd jq && return 0
+    info "需要 jq 才能编辑 sing-box 配置，开始按需安装..."
+    case "$OS" in
+        alpine)
+            apk add --no-cache jq || { err "jq 安装失败"; return 1; }
+            ;;
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_update_once || return 1
+            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 jq || { err "jq 安装失败"; return 1; }
+            ;;
+        redhat)
+            yum install -y jq || { err "jq 安装失败"; return 1; }
+            ;;
+        *)
+            err "未识别的系统类型，请手动安装 jq"
+            return 1
+            ;;
+    esac
+}
+
+install_deps() {
+    info "安装系统依赖..."
+
+    case "$OS" in
+        alpine)
+            apk update || { err "apk update 失败"; exit 1; }
+            apk add --no-cache bash wget openrc || {
+                err "基础依赖安装失败"
+                exit 1
+            }
+            ;;
+        debian)
+            ensure_fetcher
+            ;;
+        redhat)
+            ensure_fetcher
             ;;
         *)
             warn "未识别的系统类型,尝试继续..."
             ;;
     esac
-    
-    info "依赖安装完成"
+
+    info "基础依赖准备完成"
 }
 
 install_deps
-
-# -----------------------
-# 工具函数
-# 生成随机端口
-rand_port() {
-    local port
-    port=$(shuf -i 10000-60000 -n 1 2>/dev/null) || port=$((RANDOM % 50001 + 10000))
-    echo "$port"
-}
-
-# 生成随机密码
-rand_pass() {
-    local pass
-    pass=$(openssl rand -base64 16 2>/dev/null | tr -d '\n\r') || pass=$(head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r')
-    echo "$pass"
-}
-
-# 生成UUID
-rand_uuid() {
-    local uuid
-    if [ -f /proc/sys/kernel/random/uuid ]; then
-        uuid=$(cat /proc/sys/kernel/random/uuid)
-    else
-        uuid=$(openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/')
-    fi
-    echo "$uuid"
-}
 
 # -----------------------
 # 配置节点名称后缀
@@ -333,14 +379,35 @@ rand_port() {
     shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000))
 }
 
+rand_hex() {
+    local bytes="${1:-16}"
+    if has_cmd openssl; then
+        openssl rand -hex "$bytes" 2>/dev/null
+    elif [ -r /dev/urandom ] && has_cmd od; then
+        od -An -N"$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+    else
+        date +%s%N | sha256sum | cut -c1-$((bytes * 2))
+    fi
+}
+
 # 生成随机密码
 rand_pass() {
-    openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'
+    if has_cmd openssl; then
+        openssl rand -base64 16 2>/dev/null | tr -d '\n\r'
+    else
+        head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r' || rand_hex 16
+    fi
 }
 
 # 生成UUID
 rand_uuid() {
-    cat /proc/sys/kernel/random/uuid
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        local h
+        h=$(rand_hex 16)
+        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+    fi
 }
 
 # -----------------------
@@ -416,8 +483,8 @@ get_config() {
     fi
     echo "$PORT_ANYTLS" | grep -Eq '^[0-9]+$' && [ "$PORT_ANYTLS" -ge 1 ] && [ "$PORT_ANYTLS" -le 65535 ] || { err "AnyTLS Reality 端口必须是 1-65535 的数字"; exit 1; }
 
-    ANYTLS_USER=$(openssl rand -hex 4)
-    ANYTLS_PSK=$(openssl rand -base64 16)
+    ANYTLS_USER=$(rand_hex 4)
+    ANYTLS_PSK=$(rand_pass)
 
     info "AnyTLS Reality 端口: $PORT_ANYTLS"
     info "AnyTLS Reality 用户名: $ANYTLS_USER"
@@ -435,7 +502,7 @@ get_config() {
         echo "$PORT_SOCKS" | grep -Eq '^[0-9]+$' && [ "$PORT_SOCKS" -ge 1 ] && [ "$PORT_SOCKS" -le 65535 ] || { err "SOCKS5 端口必须是 1-65535 的数字"; exit 1; }
         read -p "请输入 SOCKS5 用户名(留空自动生成): " USER_SOCKS_USERNAME
         read -p "请输入 SOCKS5 密码(留空自动生成): " USER_SOCKS_PASSWORD
-        SOCKS_USERNAME="${USER_SOCKS_USERNAME:-socks$(openssl rand -hex 2)}"
+        SOCKS_USERNAME="${USER_SOCKS_USERNAME:-socks$(rand_hex 2)}"
         SOCKS_PASSWORD="${USER_SOCKS_PASSWORD:-$(rand_pass)}"
         info "SOCKS5 端口: $PORT_SOCKS"
         info "SOCKS5 用户名: $SOCKS_USERNAME"
@@ -472,7 +539,8 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            ensure_fetcher
+            bash <(fetch "https://sing-box.app/install.sh") || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -1001,7 +1069,7 @@ get_public_ip() {
         "https://ipecho.net/plain" \
         "https://api6.ipify.org" \
         "https://v6.ident.me"; do
-        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        ip=$(fetch "$url" 2>/dev/null | tr -d '[:space:]' || true)
         if [ -n "$ip" ]; then
             echo "$ip"
             return 0
@@ -1147,6 +1215,76 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+APT_UPDATED=0
+
+apt_update_once() {
+    case "$OS" in
+        debian)
+            if [ "${APT_UPDATED:-0}" -eq 0 ]; then
+                apt-get update -y || { err "apt update 失败"; return 1; }
+                APT_UPDATED=1
+            fi
+            ;;
+    esac
+}
+
+fetch() {
+    local url="$1"
+    if has_cmd curl; then
+        curl -fsSL --connect-timeout 5 "$url"
+    elif has_cmd wget; then
+        wget -qO- --timeout=5 "$url"
+    else
+        return 127
+    fi
+}
+
+ensure_fetcher() {
+    if has_cmd curl || has_cmd wget; then
+        return 0
+    fi
+    case "$OS" in
+        alpine)
+            apk add --no-cache wget || { err "下载器安装失败"; return 1; }
+            ;;
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_update_once || return 1
+            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 wget || { err "下载器安装失败"; return 1; }
+            ;;
+        redhat)
+            yum install -y wget || { err "下载器安装失败"; return 1; }
+            ;;
+        *)
+            err "未识别的系统类型，且未找到 curl/wget"
+            return 1
+            ;;
+    esac
+}
+
+ensure_jq() {
+    has_cmd jq && return 0
+    info "需要 jq 才能编辑 sing-box 配置，开始按需安装..."
+    case "$OS" in
+        alpine)
+            apk add --no-cache jq || { err "jq 安装失败"; return 1; }
+            ;;
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_update_once || return 1
+            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 jq || { err "jq 安装失败"; return 1; }
+            ;;
+        redhat)
+            yum install -y jq || { err "jq 安装失败"; return 1; }
+            ;;
+        *)
+            err "未识别的系统类型，请手动安装 jq"
+            return 1
+            ;;
+    esac
+}
+
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
 PROTOCOL_FILE="/etc/sing-box/.protocols"
@@ -1194,9 +1332,33 @@ service_status_pause() {
 }
 
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
-rand_pass() { openssl rand -base64 16 2>/dev/null | tr -d '\n\r' || head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r'; }
-rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
-rand_sid() { openssl rand -hex 4 2>/dev/null || echo "01234567"; }
+rand_hex() {
+    local bytes="${1:-16}"
+    if has_cmd openssl; then
+        openssl rand -hex "$bytes" 2>/dev/null
+    elif [ -r /dev/urandom ] && has_cmd od; then
+        od -An -N"$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+    else
+        date +%s%N | sha256sum | cut -c1-$((bytes * 2))
+    fi
+}
+rand_pass() {
+    if has_cmd openssl; then
+        openssl rand -base64 16 2>/dev/null | tr -d '\n\r'
+    else
+        head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r' || rand_hex 16
+    fi
+}
+rand_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        local h
+        h=$(rand_hex 16)
+        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+    fi
+}
+rand_sid() { rand_hex 4; }
 
 ensure_valid_port() {
     local port="$1"
@@ -1209,6 +1371,7 @@ url_encode() {
 }
 
 need_config() {
+    ensure_jq || return 1
     if [ ! -f "$CONFIG_PATH" ]; then
         err "未找到配置文件: $CONFIG_PATH"
         return 1
@@ -1507,7 +1670,7 @@ get_public_ip() {
         "https://ifconfig.me" \
         "https://api6.ipify.org" \
         "https://v6.ident.me"; do
-        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        ip=$(fetch "$url" 2>/dev/null | tr -d '[:space:]')
         [ -n "$ip" ] && echo "$ip" && return 0
     done
     echo "YOUR_SERVER_IP"
@@ -1922,7 +2085,7 @@ action_add_socks() {
     read -p "输入 SOCKS5 用户名(留空自动生成): " new_user
     read -p "输入 SOCKS5 密码(留空自动生成): " new_pass
     new_port="${new_port:-$(rand_port)}"
-    new_user="${new_user:-socks$(openssl rand -hex 2)}"
+    new_user="${new_user:-socks$(rand_hex 2)}"
     new_pass="${new_pass:-$(rand_pass)}"
     ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "socks-in")
@@ -1980,7 +2143,12 @@ action_delete_anytls() {
 
 action_update() {
     info "开始更新 sing-box..."
-    if [ "$OS" = "alpine" ]; then apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh); else bash <(curl -fsSL https://sing-box.app/install.sh); fi
+    ensure_fetcher || return 1
+    if [ "$OS" = "alpine" ]; then
+        apk update && apk upgrade sing-box || bash <(fetch "https://sing-box.app/install.sh")
+    else
+        bash <(fetch "https://sing-box.app/install.sh")
+    fi
     info "更新完成,已重启服务..."
     if command -v sing-box >/dev/null 2>&1; then NEW_VER=$(sing-box version 2>/dev/null | head -n1); info "当前版本: $NEW_VER"; service_restart || warn "重启失败"; fi
 }
