@@ -7,9 +7,6 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-APT_IPV4_OPTS="-o Acquire::ForceIPv4=true"
-CURL_IPV4_OPTS="-4"
-
 # -----------------------
 # 检测系统类型
 detect_os() {
@@ -41,7 +38,7 @@ info "检测到系统: $OS (${OS_ID:-unknown})"
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         err "此脚本需要 root 权限"
-        err "请使用: sudo bash -c \"\$(curl ${CURL_IPV4_OPTS} -fsSL ...)\" 或切换到 root 用户"
+        err "请使用: sudo bash -c \"\$(curl -fsSL ...)\" 或切换到 root 用户"
         exit 1
     fi
 }
@@ -63,8 +60,8 @@ install_deps() {
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get ${APT_IPV4_OPTS} update -y || { err "apt update 失败"; exit 1; }
-            apt-get ${APT_IPV4_OPTS} install -y curl ca-certificates openssl jq || {
+            apt-get update -y || { err "apt update 失败"; exit 1; }
+            apt-get install -y curl ca-certificates openssl jq || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -359,6 +356,7 @@ get_config() {
             read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
             PORT_SS="${USER_PORT_SS:-$(rand_port)}"
         fi
+        echo "$PORT_SS" | grep -Eq '^[0-9]+$' && [ "$PORT_SS" -ge 1 ] && [ "$PORT_SS" -le 65535 ] || { err "SS 端口必须是 1-65535 的数字"; exit 1; }
         PSK_SS=$(rand_pass)
         info "SS 端口: $PORT_SS"
         info "SS 加密方式: $SS_METHOD"
@@ -373,6 +371,7 @@ get_config() {
             read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
             PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
         fi
+        echo "$PORT_HY2" | grep -Eq '^[0-9]+$' && [ "$PORT_HY2" -ge 1 ] && [ "$PORT_HY2" -le 65535 ] || { err "HY2 端口必须是 1-65535 的数字"; exit 1; }
         PSK_HY2=$(rand_pass)
         info "HY2 端口: $PORT_HY2"
         info "HY2 密码已自动生成"
@@ -386,6 +385,7 @@ get_config() {
             read -p "请输入 TUIC 端口(留空则随机 10000-60000): " USER_PORT_TUIC
             PORT_TUIC="${USER_PORT_TUIC:-$(rand_port)}"
         fi
+        echo "$PORT_TUIC" | grep -Eq '^[0-9]+$' && [ "$PORT_TUIC" -ge 1 ] && [ "$PORT_TUIC" -le 65535 ] || { err "TUIC 端口必须是 1-65535 的数字"; exit 1; }
         PSK_TUIC=$(rand_pass)
         UUID_TUIC=$(rand_uuid)
         info "TUIC 端口: $PORT_TUIC"
@@ -400,6 +400,7 @@ get_config() {
             read -p "请输入 VLESS Reality 端口(留空则随机 10000-60000): " USER_PORT_REALITY
             PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
         fi
+        echo "$PORT_REALITY" | grep -Eq '^[0-9]+$' && [ "$PORT_REALITY" -ge 1 ] && [ "$PORT_REALITY" -le 65535 ] || { err "VLESS Reality 端口必须是 1-65535 的数字"; exit 1; }
         UUID=$(rand_uuid)
         info "VLESS Reality 端口: $PORT_REALITY"
         info "VLESS Reality UUID 已自动生成"
@@ -413,6 +414,7 @@ get_config() {
         read -p "请输入 AnyTLS Reality 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS
         PORT_ANYTLS="${USER_PORT_ANYTLS:-$(rand_port)}"
     fi
+    echo "$PORT_ANYTLS" | grep -Eq '^[0-9]+$' && [ "$PORT_ANYTLS" -ge 1 ] && [ "$PORT_ANYTLS" -le 65535 ] || { err "AnyTLS Reality 端口必须是 1-65535 的数字"; exit 1; }
 
     ANYTLS_USER=$(openssl rand -hex 4)
     ANYTLS_PSK=$(openssl rand -base64 16)
@@ -430,6 +432,7 @@ get_config() {
             read -p "请输入 SOCKS5 端口(留空则随机 10000-60000): " USER_PORT_SOCKS
             PORT_SOCKS="${USER_PORT_SOCKS:-$(rand_port)}"
         fi
+        echo "$PORT_SOCKS" | grep -Eq '^[0-9]+$' && [ "$PORT_SOCKS" -ge 1 ] && [ "$PORT_SOCKS" -le 65535 ] || { err "SOCKS5 端口必须是 1-65535 的数字"; exit 1; }
         read -p "请输入 SOCKS5 用户名(留空自动生成): " USER_SOCKS_USERNAME
         read -p "请输入 SOCKS5 密码(留空自动生成): " USER_SOCKS_PASSWORD
         SOCKS_USERNAME="${USER_SOCKS_USERNAME:-socks$(openssl rand -hex 2)}"
@@ -469,7 +472,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            bash <(curl ${CURL_IPV4_OPTS} -fsSL https://sing-box.app/install.sh) || {
+            bash <(curl -fsSL https://sing-box.app/install.sh) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -988,18 +991,34 @@ setup_service
 get_public_ip() {
     local ip=""
     for url in \
+        "https://api4.ipify.org" \
+        "https://api64.ipify.org" \
         "https://api.ipify.org" \
+        "https://ident.me" \
         "https://ipinfo.io/ip" \
         "https://ifconfig.me" \
         "https://icanhazip.com" \
-        "https://ipecho.net/plain"; do
-        ip=$(curl ${CURL_IPV4_OPTS} -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        "https://ipecho.net/plain" \
+        "https://api6.ipify.org" \
+        "https://v6.ident.me"; do
+        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ip" ]; then
             echo "$ip"
             return 0
         fi
     done
     return 1
+}
+
+format_host_for_uri() {
+    local host="$1"
+    if [[ "$host" == \[*\] ]]; then
+        echo "$host"
+    elif [[ "$host" == *:* ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
 }
 
 # 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
@@ -1019,6 +1038,8 @@ fi
 # 生成链接(仅生成已选择的协议)
 generate_uris() {
     local host="$PUB_IP"
+    local uri_host
+    uri_host=$(format_host_for_uri "$host")
     
     if $ENABLE_SS; then
         local ss_userinfo="${SS_METHOD}:${PSK_SS}"
@@ -1026,28 +1047,28 @@ generate_uris() {
         ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
 
         echo "=== Shadowsocks (SS) ==="
-        echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
-        echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_encoded}@${uri_host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_b64}@${uri_host}:${PORT_SS}#ss${suffix}"
         echo ""
     fi
     
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        echo "hy2://${hy2_encoded}@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
         echo ""
     fi
 
     if $ENABLE_TUIC; then
         tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== TUIC ==="
-        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
+        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
         echo ""
     fi
     
     if $ENABLE_REALITY; then
         echo "=== VLESS Reality ==="
-        echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
+        echo "vless://${UUID}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
         echo ""
     fi
 
@@ -1055,7 +1076,7 @@ generate_uris() {
         anytls_user_encoded=$(printf "%s" "$ANYTLS_USER" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         anytls_pass_encoded=$(printf "%s" "$ANYTLS_PSK" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== AnyTLS Reality ==="
-        echo "anytls://${anytls_pass_encoded}@${host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
+        echo "anytls://${anytls_pass_encoded}@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
         echo ""
     fi
 
@@ -1063,7 +1084,7 @@ generate_uris() {
         socks_user_encoded=$(printf "%s" "$SOCKS_USERNAME" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         socks_pass_encoded=$(printf "%s" "$SOCKS_PASSWORD" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== SOCKS5 ==="
-        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${host}:${PORT_SOCKS}#socks${suffix}"
+        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${uri_host}:${PORT_SOCKS}#socks${suffix}"
         echo "${host}:${PORT_SOCKS} 用户名=${SOCKS_USERNAME} 密码=${SOCKS_PASSWORD}"
         echo ""
     fi
@@ -1126,9 +1147,6 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-APT_IPV4_OPTS="-o Acquire::ForceIPv4=true"
-CURL_IPV4_OPTS="-4"
-
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
 PROTOCOL_FILE="/etc/sing-box/.protocols"
@@ -1169,11 +1187,22 @@ service_start() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || sy
 service_stop() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"; }
 service_restart() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"; }
 service_status() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager; }
+service_status_pause() {
+    service_status
+    echo
+    read -r -p "按回车返回菜单..." _
+}
 
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
 rand_pass() { openssl rand -base64 16 2>/dev/null | tr -d '\n\r' || head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r'; }
 rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
 rand_sid() { openssl rand -hex 4 2>/dev/null || echo "01234567"; }
+
+ensure_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
 
 url_encode() {
     printf "%s" "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'
@@ -1446,22 +1475,22 @@ select_tag_from_list() {
     local tags=("$@")
     local count="${#tags[@]}"
     [ "$count" -gt 0 ] || return 1
-    echo
-    echo "$title"
+    echo >&2
+    echo "$title" >&2
     local i
     for ((i=0; i<count; i++)); do
-        echo "$((i+1))) ${tags[$i]}"
+        echo "$((i+1))) ${tags[$i]}" >&2
     done
     while true; do
-        read -p "请选择编号: " choice
+        read -r -p "请选择编号: " choice
         case "$choice" in
-            ''|*[!0-9]*) warn "请输入数字编号" ;;
+            ''|*[!0-9]*) warn "请输入数字编号" >&2 ;;
             *)
                 if [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
-                    echo "${tags[$((choice-1))]}"
+                    printf '%s\n' "${tags[$((choice-1))]}"
                     return 0
                 fi
-                warn "编号超出范围"
+                warn "编号超出范围" >&2
                 ;;
         esac
     done
@@ -1469,16 +1498,36 @@ select_tag_from_list() {
 
 get_public_ip() {
     local ip=""
-    for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
-        ip=$(curl ${CURL_IPV4_OPTS} -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+    for url in \
+        "https://api4.ipify.org" \
+        "https://api64.ipify.org" \
+        "https://api.ipify.org" \
+        "https://ident.me" \
+        "https://ipinfo.io/ip" \
+        "https://ifconfig.me" \
+        "https://api6.ipify.org" \
+        "https://v6.ident.me"; do
+        ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
         [ -n "$ip" ] && echo "$ip" && return 0
     done
     echo "YOUR_SERVER_IP"
 }
 
+format_host_for_uri() {
+    local host="$1"
+    if [[ "$host" == \[*\] ]]; then
+        echo "$host"
+    elif [[ "$host" == *:* ]]; then
+        echo "[$host]"
+    else
+        echo "$host"
+    fi
+}
+
 generate_uris() {
     read_config || return 1
     if [ -n "${CUSTOM_IP:-}" ]; then PUBLIC_IP="$CUSTOM_IP"; else PUBLIC_IP=$(get_public_ip); fi
+    URI_HOST=$(format_host_for_uri "$PUBLIC_IP")
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     : > "$URI_FILE"
 
@@ -1489,8 +1538,8 @@ generate_uris() {
             ss_userinfo="${SS_METHODS[$i]}:${SS_PSKS[$i]}"
             ss_encoded=$(url_encode "$ss_userinfo")
             ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-            echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
-            echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_encoded}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_b64}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1500,7 +1549,7 @@ generate_uris() {
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
         for ((i=0; i<HY2_COUNT; i++)); do
             hy2_encoded=$(url_encode "${HY2_PSKS[$i]}")
-            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "hy2://${hy2_encoded}@${URI_HOST}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1510,7 +1559,7 @@ generate_uris() {
         echo "=== TUIC ===" >> "$URI_FILE"
         for ((i=0; i<TUIC_COUNT; i++)); do
             tuic_encoded=$(url_encode "${TUIC_PSKS[$i]}")
-            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${URI_HOST}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1520,7 +1569,7 @@ generate_uris() {
         if [ "$REALITY_COUNT" -gt 0 ]; then
             echo "=== VLESS Reality ===" >> "$URI_FILE"
             for ((i=0; i<REALITY_COUNT; i++)); do
-                echo "vless://${REALITY_UUIDS[$i]}@${PUBLIC_IP}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+                echo "vless://${REALITY_UUIDS[$i]}@${URI_HOST}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             done
             echo >> "$URI_FILE"
         fi
@@ -1531,7 +1580,7 @@ generate_uris() {
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
         for ((i=0; i<ANYTLS_COUNT; i++)); do
             anytls_encoded=$(url_encode "${ANYTLS_PSKS[$i]}")
-            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${URI_HOST}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1542,7 +1591,7 @@ generate_uris() {
         for ((i=0; i<SOCKS_COUNT; i++)); do
             socks_user_encoded=$(url_encode "${SOCKS_USERS[$i]}")
             socks_pass_encoded=$(url_encode "${SOCKS_PASSWORDS[$i]}")
-            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${PUBLIC_IP}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${URI_HOST}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             echo "${SOCKS_TAGS[$i]} => ${PUBLIC_IP}:${SOCKS_PORTS[$i]} 用户名=${SOCKS_USERS[$i]} 密码=${SOCKS_PASSWORDS[$i]}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
@@ -1595,8 +1644,28 @@ apply_relay_settings() {
     validate_and_restart
 }
 
-action_view_uri() { info "正在生成并显示 URI..."; generate_uris || { err "生成 URI 失败"; return 1; }; echo; cat "$URI_FILE"; }
-action_view_config() { echo "$CONFIG_PATH"; }
+action_view_uri() {
+    info "正在生成并显示 URI..."
+    generate_uris || { err "生成 URI 失败"; return 1; }
+    echo
+    cat "$URI_FILE"
+    echo
+    read -r -p "按回车返回菜单..." _
+}
+
+action_regenerate_uri() {
+    generate_uris || { err "生成 URI 失败"; return 1; }
+    echo
+    cat "$URI_FILE"
+    echo
+    read -r -p "按回车返回菜单..." _
+}
+
+action_view_config() {
+    echo "$CONFIG_PATH"
+    echo
+    read -r -p "按回车返回菜单..." _
+}
 
 action_edit_config() {
     [ -f "$CONFIG_PATH" ] || { err "配置文件不存在: $CONFIG_PATH"; return 1; }
@@ -1620,6 +1689,7 @@ action_reset_ss() {
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
     read -p "输入新的 SS 端口(回车保持 ${current_port}): " new_port
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1633,6 +1703,7 @@ action_add_ss() {
     new_port="${new_port:-$(rand_port)}"
     new_method="${new_method:-2022-blake3-aes-128-gcm}"
     new_psk="${new_psk:-$(rand_pass)}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "ss-in")
     inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:$tag}')
     backup_config
@@ -1661,6 +1732,7 @@ action_reset_hy2() {
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
     read -p "输入新的 HY2 端口(回车保持 ${current_port}): " new_port
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1672,6 +1744,7 @@ action_add_hy2() {
     read -p "输入 HY2 密码(留空自动生成): " new_psk
     new_port="${new_port:-$(rand_port)}"
     new_psk="${new_psk:-$(rand_pass)}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "hy2-in")
     inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:$tag,listen:"::",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
@@ -1700,6 +1773,7 @@ action_reset_tuic() {
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
     read -p "输入新的 TUIC 端口(回车保持 ${current_port}): " new_port
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1713,6 +1787,7 @@ action_add_tuic() {
     new_port="${new_port:-$(rand_port)}"
     new_uuid="${new_uuid:-$(rand_uuid)}"
     new_psk="${new_psk:-$(rand_pass)}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "tuic-in")
     inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
@@ -1743,6 +1818,7 @@ action_list_reality() {
         echo "$((i+1))) ${REALITY_TAGS[$i]} | port: ${REALITY_PORTS[$i]} | uuid: ${REALITY_UUIDS[$i]} | sid: ${REALITY_SIDS[$i]}"
     done
     echo
+    read -r -p "按回车返回菜单..." _
 }
 
 action_add_reality() {
@@ -1750,6 +1826,7 @@ action_add_reality() {
     [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增"; return 1; }
     read -p "输入新的 VLESS Reality 端口(留空随机 10000-60000): " new_port
     new_port="${new_port:-$(rand_port)}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     next_index=$(jq -r '[.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true and (.tag|test("^vless-in-[0-9]+$"))) | (.tag | split("-") | last | tonumber)] | max // 0' "$CONFIG_PATH")
     next_index=$((next_index + 1))
     new_tag="vless-in-$next_index"
@@ -1801,6 +1878,7 @@ action_reset_reality() {
     current_port="${REALITY_PORTS[$idx]}"
     read -p "输入新的端口(回车保持 $current_port): " new_port
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag == $tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1813,6 +1891,7 @@ action_reset_anytls() {
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
     read -p "输入新的 AnyTLS Reality 端口(回车保持 ${current_port}): " new_port
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1829,6 +1908,7 @@ action_reset_socks() {
     read -p "输入新的 SOCKS5 用户名(回车保持 ${current_user}): " new_user
     read -p "输入新的 SOCKS5 密码(回车保持当前): " new_pass
     new_port="${new_port:-$current_port}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_user="${new_user:-$current_user}"
     new_pass="${new_pass:-$current_pass}"
     backup_config
@@ -1844,6 +1924,7 @@ action_add_socks() {
     new_port="${new_port:-$(rand_port)}"
     new_user="${new_user:-socks$(openssl rand -hex 2)}"
     new_pass="${new_pass:-$(rand_pass)}"
+    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "socks-in")
     inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '{type:"socks",tag:$tag,listen:"::",listen_port:$port,users:[{username:$user,password:$pass}]}' )
     backup_config
@@ -1899,7 +1980,7 @@ action_delete_anytls() {
 
 action_update() {
     info "开始更新 sing-box..."
-    if [ "$OS" = "alpine" ]; then apk update && apk upgrade sing-box || bash <(curl ${CURL_IPV4_OPTS} -fsSL https://sing-box.app/install.sh); else bash <(curl ${CURL_IPV4_OPTS} -fsSL https://sing-box.app/install.sh); fi
+    if [ "$OS" = "alpine" ]; then apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh); else bash <(curl -fsSL https://sing-box.app/install.sh); fi
     info "更新完成,已重启服务..."
     if command -v sing-box >/dev/null 2>&1; then NEW_VER=$(sing-box version 2>/dev/null | head -n1); info "当前版本: $NEW_VER"; service_restart || warn "重启失败"; fi
 }
@@ -1917,6 +1998,7 @@ action_show_relay_status() {
         echo "当前为直连模式，没有启用上游 SS 中转"
     fi
     echo
+    read -r -p "按回车返回菜单..." _
 }
 
 action_configure_relay_upstream() {
@@ -2091,7 +2173,7 @@ menu_links_and_config() {
         read -p "请输入选项: " subopt
         case "$subopt" in
             1) action_view_uri ;;
-            2) generate_uris && cat "$URI_FILE" ;;
+            2) action_regenerate_uri ;;
             3) action_view_config ;;
             4) action_edit_config ;;
             0) return 0 ;;
@@ -2281,7 +2363,7 @@ menu_service() {
         echo "------------------------------------"
         read -p "请输入选项: " subopt
         case "$subopt" in
-            1) service_status ;;
+            1) service_status_pause ;;
             2) action_update ;;
             3) action_uninstall ;;
             0) return 0 ;;
