@@ -7,6 +7,197 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+APT_IPV4_OPTS="-o Acquire::ForceIPv4=true"
+CURL_IPV4_OPTS="-4"
+CURL_RETRY_OPTS="--retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120"
+DEFAULT_LISTEN="0.0.0.0"
+SB_PID_FILE="/run/sing-box.pid"
+SB_LOG_FILE="/var/log/sing-box.log"
+SB_ERR_FILE="/var/log/sing-box.err"
+SERVICE_BACKEND=""
+HAS_SYSTEMD=false
+IS_CONTAINER=false
+SB_BIN=""
+
+trim_spaces() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+assert_non_empty() {
+    local value="$1"
+    local field_name="$2"
+    if [ -z "$value" ]; then
+        err "${field_name} 不能为空"
+        return 1
+    fi
+}
+
+is_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+port_in_use_in_config() {
+    local port="$1"
+    local exclude_tag="${2:-}"
+    [ -f "${CONFIG_PATH:-/etc/sing-box/config.json}" ] || return 1
+    if [ -n "$exclude_tag" ]; then
+        jq -e --argjson port "$port" --arg tag "$exclude_tag" '.inbounds[]? | select((.listen_port == $port) and (.tag != $tag))' "${CONFIG_PATH:-/etc/sing-box/config.json}" >/dev/null 2>&1
+    else
+        jq -e --argjson port "$port" '.inbounds[]? | select(.listen_port == $port)' "${CONFIG_PATH:-/etc/sing-box/config.json}" >/dev/null 2>&1
+    fi
+}
+
+assert_port_available() {
+    local port="$1"
+    local exclude_tag="${2:-}"
+    if ! is_valid_port "$port"; then
+        err "端口无效：$port，必须为 1-65535 的数字"
+        return 1
+    fi
+    if port_in_use_in_config "$port" "$exclude_tag"; then
+        err "端口已被现有配置占用：$port"
+        return 1
+    fi
+    return 0
+}
+
+rand_port_available() {
+    local port
+    local i=0
+    while [ $i -lt 30 ]; do
+        port=$(shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)))
+        if ! port_in_use_in_config "$port"; then
+            echo "$port"
+            return 0
+        fi
+        i=$((i+1))
+    done
+    err "无法生成可用随机端口"
+    return 1
+}
+
+prompt_port() {
+    local prompt_text="$1"
+    local default_port="${2:-}"
+    local exclude_tag="${3:-}"
+    local input
+    while true; do
+        if [ -n "$default_port" ]; then
+            read -p "${prompt_text}(回车默认 ${default_port}): " input
+            input="${input:-$default_port}"
+        else
+            read -p "${prompt_text}: " input
+        fi
+        input="$(trim_spaces "$input")"
+        if assert_port_available "$input" "$exclude_tag"; then
+            printf '%s
+' "$input"
+            return 0
+        fi
+    done
+}
+
+is_valid_sni() {
+    local sni="$1"
+    [ -n "$sni" ] || return 1
+    [ "${#sni}" -le 253 ] || return 1
+    [[ "$sni" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$sni" == *.* ]] || return 1
+    [[ ! "$sni" =~ ^[.-] ]] || return 1
+    [[ ! "$sni" =~ [.-]$ ]] || return 1
+    [[ "$sni" != *..* ]] || return 1
+    return 0
+}
+
+assert_valid_sni() {
+    local sni="$1"
+    if ! is_valid_sni "$sni"; then
+        err "SNI 无效：$sni"
+        return 1
+    fi
+}
+
+url_decode() {
+    local data="$1"
+    data="${data//+/ }"
+    printf '%b' "${data//%/\x}"
+}
+
+decode_base64_compat() {
+    local data="$1"
+    local mod padded
+    data="${data//-/+}"
+    data="${data//_//}"
+    mod=$(( ${#data} % 4 ))
+    padded="$data"
+    if [ "$mod" -eq 2 ]; then
+        padded="${data}=="
+    elif [ "$mod" -eq 3 ]; then
+        padded="${data}="
+    elif [ "$mod" -eq 1 ]; then
+        return 1
+    fi
+    printf '%s' "$padded" | base64 -d 2>/dev/null
+}
+
+parse_ss_uri() {
+    local uri="$1"
+    local body userinfo hostport decoded method password host port
+    PARSED_SS_SERVER=""
+    PARSED_SS_PORT=""
+    PARSED_SS_METHOD=""
+    PARSED_SS_PASSWORD=""
+
+    uri="$(trim_spaces "$uri")"
+    [[ "$uri" == ss://* ]] || { err "不是有效的 SS 链接"; return 1; }
+    body="${uri#ss://}"
+    body="${body%%#*}"
+    body="${body%%\?*}"
+    echo "$body" | grep -q 'plugin=' && { err "当前中转模式不支持带 plugin 的 SS 链接"; return 1; }
+    [[ "$body" == *@* ]] || { err "SS 链接缺少主机和端口"; return 1; }
+
+    userinfo="${body%@*}"
+    hostport="${body##*@}"
+    userinfo="$(url_decode "$userinfo")"
+
+    if [[ "$userinfo" == *:* ]]; then
+        method="${userinfo%%:*}"
+        password="${userinfo#*:}"
+    else
+        decoded="$(decode_base64_compat "$userinfo" 2>/dev/null || true)"
+        [ -n "$decoded" ] || { err "SS 链接用户信息 base64 解码失败"; return 1; }
+        decoded="$(url_decode "$decoded")"
+        [[ "$decoded" == *:* ]] || { err "SS 链接缺少 method:password"; return 1; }
+        method="${decoded%%:*}"
+        password="${decoded#*:}"
+    fi
+
+    if [[ "$hostport" =~ ^\[(.*)\]:(.+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+    fi
+
+    host="$(trim_spaces "$host")"
+    port="$(trim_spaces "$port")"
+    method="$(trim_spaces "$method")"
+
+    [ -n "$host" ] || { err "SS 链接中的服务器地址为空"; return 1; }
+    is_valid_port "$port" || { err "SS 链接中的端口无效：$port"; return 1; }
+    [ -n "$method" ] || { err "SS 链接中的加密方式为空"; return 1; }
+    [ -n "$password" ] || { err "SS 链接中的密码为空"; return 1; }
+
+    PARSED_SS_SERVER="$host"
+    PARSED_SS_PORT="$port"
+    PARSED_SS_METHOD="$method"
+    PARSED_SS_PASSWORD="$password"
+    return 0
+}
+
 # -----------------------
 # 检测系统类型
 detect_os() {
@@ -31,14 +222,50 @@ detect_os() {
 }
 
 detect_os
-info "检测到系统: $OS (${OS_ID:-unknown})"
+
+is_container_env() {
+    [ -f /.dockerenv ] && return 0
+    [ -f /run/.containerenv ] && return 0
+    grep -qaE '(docker|lxc|containerd|kubepods|podman|openvz)' /proc/1/cgroup 2>/dev/null && return 0
+    return 1
+}
+
+has_working_systemd() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]')" = "systemd" ] || return 1
+    systemctl list-unit-files >/dev/null 2>&1 || return 1
+    return 0
+}
+
+setup_runtime_env() {
+    if is_container_env; then
+        IS_CONTAINER=true
+    fi
+    if has_working_systemd; then
+        HAS_SYSTEMD=true
+        SERVICE_BACKEND="systemd"
+    elif [ "$OS" = "alpine" ]; then
+        SERVICE_BACKEND="openrc"
+    else
+        SERVICE_BACKEND="process"
+    fi
+}
+
+set_sb_bin() {
+    SB_BIN="$(command -v sing-box 2>/dev/null || true)"
+    [ -n "$SB_BIN" ] || SB_BIN="/usr/bin/sing-box"
+}
+
+setup_runtime_env
+info "检测到系统: $OS (${OS_ID:-unknown}), 服务后端: ${SERVICE_BACKEND}"
 
 # -----------------------
 # 检查 root 权限
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         err "此脚本需要 root 权限"
-        err "请使用: sudo bash -c \"\$(curl -fsSL ...)\" 或切换到 root 用户"
+        err "请使用: sudo bash -c \"\$(curl ${CURL_IPV4_OPTS} -fsSL ...)\" 或切换到 root 用户"
         exit 1
     fi
 }
@@ -46,114 +273,70 @@ check_root() {
 check_root
 
 # -----------------------
-# 安装依赖（低内存友好：仅确保下载器存在，jq 按需安装）
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-APT_UPDATED=0
-
-apt_update_once() {
-    case "$OS" in
-        debian)
-            if [ "${APT_UPDATED:-0}" -eq 0 ]; then
-                apt-get update -y || { err "apt update 失败"; return 1; }
-                APT_UPDATED=1
-            fi
-            ;;
-    esac
-}
-
-fetch() {
-    local url="$1"
-    if has_cmd curl; then
-        curl -fsSL --connect-timeout 5 "$url"
-    elif has_cmd wget; then
-        wget -qO- --timeout=5 "$url"
-    else
-        return 127
-    fi
-}
-
-ensure_fetcher() {
-    if has_cmd curl || has_cmd wget; then
-        return 0
-    fi
-
-    case "$OS" in
-        alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache wget || {
-                err "下载器安装失败"
-                exit 1
-            }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt_update_once || exit 1
-            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 wget || {
-                err "下载器安装失败"
-                exit 1
-            }
-            ;;
-        redhat)
-            yum install -y wget || {
-                err "下载器安装失败"
-                exit 1
-            }
-            ;;
-        *)
-            err "未识别的系统类型，且未找到 curl/wget"
-            exit 1
-            ;;
-    esac
-}
-
-ensure_jq() {
-    has_cmd jq && return 0
-    info "需要 jq 才能编辑 sing-box 配置，开始按需安装..."
-    case "$OS" in
-        alpine)
-            apk add --no-cache jq || { err "jq 安装失败"; return 1; }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt_update_once || return 1
-            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 jq || { err "jq 安装失败"; return 1; }
-            ;;
-        redhat)
-            yum install -y jq || { err "jq 安装失败"; return 1; }
-            ;;
-        *)
-            err "未识别的系统类型，请手动安装 jq"
-            return 1
-            ;;
-    esac
-}
-
+# 安装依赖
 install_deps() {
     info "安装系统依赖..."
-
+    
     case "$OS" in
         alpine)
             apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash wget openrc || {
-                err "基础依赖安装失败"
+            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
+                err "依赖安装失败"
                 exit 1
             }
             ;;
         debian)
-            ensure_fetcher
+            export DEBIAN_FRONTEND=noninteractive
+            mkdir -p /etc/apt/apt.conf.d
+            echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4-singbox
+            apt-get ${APT_IPV4_OPTS} update || { err "apt update 失败"; exit 1; }
+            apt-get ${APT_IPV4_OPTS} install -y --no-install-recommends curl ca-certificates openssl jq procps || {
+                err "依赖安装失败"
+                exit 1
+            }
             ;;
         redhat)
-            ensure_fetcher
+            yum install -y curl ca-certificates openssl jq || {
+                err "依赖安装失败"
+                exit 1
+            }
             ;;
         *)
             warn "未识别的系统类型,尝试继续..."
             ;;
     esac
-
-    info "基础依赖准备完成"
+    
+    info "依赖安装完成"
 }
 
 install_deps
+
+# -----------------------
+# 工具函数
+# 生成随机端口
+rand_port() {
+    local port
+    port=$(shuf -i 10000-60000 -n 1 2>/dev/null) || port=$((RANDOM % 50001 + 10000))
+    echo "$port"
+}
+
+# 生成随机密码
+rand_pass() {
+    local pass
+    pass=$(openssl rand -base64 16 2>/dev/null | tr -d '\n\r') || pass=$(head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r')
+    echo "$pass"
+}
+
+# 生成UUID
+rand_uuid() {
+    local uuid
+    if [ -f /proc/sys/kernel/random/uuid ]; then
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+    else
+        uuid=$(openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/')
+    fi
+    echo "$uuid"
+}
 
 # -----------------------
 # 配置节点名称后缀
@@ -287,41 +470,44 @@ select_install_mode() {
         2)
             INSTALL_MODE="relay_ss"
             echo ""
-            echo "请输入上游 SS 服务器地址:"
-            read -r UPSTREAM_SS_SERVER
-            UPSTREAM_SS_SERVER="$(echo "$UPSTREAM_SS_SERVER" | tr -d '[:space:]')"
+            echo "请输入上游 SS 链接(ss://...)，或直接输入服务器地址:"
+            read -r upstream_input
+            upstream_input="$(trim_spaces "$upstream_input")"
 
-            while [ -z "$UPSTREAM_SS_SERVER" ]; do
-                warn "上游 SS 服务器地址不能为空"
-                read -r UPSTREAM_SS_SERVER
-                UPSTREAM_SS_SERVER="$(echo "$UPSTREAM_SS_SERVER" | tr -d '[:space:]')"
-            done
-
-            echo "请输入上游 SS 端口:"
-            read -r UPSTREAM_SS_PORT
-            UPSTREAM_SS_PORT="$(echo "$UPSTREAM_SS_PORT" | tr -d '[:space:]')"
-            while ! echo "$UPSTREAM_SS_PORT" | grep -Eq '^[0-9]+$'; do
-                warn "上游 SS 端口必须是数字"
-                read -r UPSTREAM_SS_PORT
-                UPSTREAM_SS_PORT="$(echo "$UPSTREAM_SS_PORT" | tr -d '[:space:]')"
-            done
-
-            if $ENABLE_SS; then
-                echo "请输入上游 SS 加密方式(留空默认使用本机 SS 加密方式: $SS_METHOD):"
-                read -r UPSTREAM_SS_METHOD
-                UPSTREAM_SS_METHOD="$(echo "${UPSTREAM_SS_METHOD:-$SS_METHOD}" | tr -d '[:space:]')"
+            if [[ "$upstream_input" == ss://* ]]; then
+                parse_ss_uri "$upstream_input" || exit 1
+                UPSTREAM_SS_SERVER="$PARSED_SS_SERVER"
+                UPSTREAM_SS_PORT="$PARSED_SS_PORT"
+                UPSTREAM_SS_METHOD="$PARSED_SS_METHOD"
+                UPSTREAM_SS_PASSWORD="$PARSED_SS_PASSWORD"
+                info "已自动识别上游 SS 链接: ${UPSTREAM_SS_SERVER}:${UPSTREAM_SS_PORT} | ${UPSTREAM_SS_METHOD}"
             else
-                echo "请输入上游 SS 加密方式(默认 2022-blake3-aes-128-gcm):"
-                read -r UPSTREAM_SS_METHOD
-                UPSTREAM_SS_METHOD="$(echo "${UPSTREAM_SS_METHOD:-2022-blake3-aes-128-gcm}" | tr -d '[:space:]')"
-            fi
+                UPSTREAM_SS_SERVER="$upstream_input"
+                while [ -z "$UPSTREAM_SS_SERVER" ]; do
+                    warn "上游 SS 服务器地址不能为空"
+                    read -r UPSTREAM_SS_SERVER
+                    UPSTREAM_SS_SERVER="$(trim_spaces "$UPSTREAM_SS_SERVER")"
+                done
 
-            echo "请输入上游 SS 密码:"
-            read -r UPSTREAM_SS_PASSWORD
-            while [ -z "$UPSTREAM_SS_PASSWORD" ]; do
-                warn "上游 SS 密码不能为空"
+                UPSTREAM_SS_PORT="$(prompt_port "请输入上游 SS 端口")" || exit 1
+
+                if $ENABLE_SS; then
+                    echo "请输入上游 SS 加密方式(留空默认使用本机 SS 加密方式: $SS_METHOD):"
+                    read -r UPSTREAM_SS_METHOD
+                    UPSTREAM_SS_METHOD="$(trim_spaces "${UPSTREAM_SS_METHOD:-$SS_METHOD}")"
+                else
+                    echo "请输入上游 SS 加密方式(默认 2022-blake3-aes-128-gcm):"
+                    read -r UPSTREAM_SS_METHOD
+                    UPSTREAM_SS_METHOD="$(trim_spaces "${UPSTREAM_SS_METHOD:-2022-blake3-aes-128-gcm}")"
+                fi
+
+                echo "请输入上游 SS 密码:"
                 read -r UPSTREAM_SS_PASSWORD
-            done
+                while [ -z "$UPSTREAM_SS_PASSWORD" ]; do
+                    warn "上游 SS 密码不能为空"
+                    read -r UPSTREAM_SS_PASSWORD
+                done
+            fi
 
             if $ENABLE_REALITY; then
                 RELAY_VLESS_TAGS="vless-in-1"
@@ -351,9 +537,15 @@ CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 REALITY_SNI=""
 if $ENABLE_REALITY || $ENABLE_ANYTLS; then
     echo ""
-    echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
-    read -r REALITY_SNI
-    REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
+    while true; do
+        echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
+        read -r REALITY_SNI
+        REALITY_SNI="$(trim_spaces "${REALITY_SNI:-addons.mozilla.org}")"
+        [ -n "$REALITY_SNI" ] || REALITY_SNI="addons.mozilla.org"
+        if assert_valid_sni "$REALITY_SNI"; then
+            break
+        fi
+    done
 else
     # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
     REALITY_SNI="addons.mozilla.org"
@@ -379,35 +571,14 @@ rand_port() {
     shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000))
 }
 
-rand_hex() {
-    local bytes="${1:-16}"
-    if has_cmd openssl; then
-        openssl rand -hex "$bytes" 2>/dev/null
-    elif [ -r /dev/urandom ] && has_cmd od; then
-        od -An -N"$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
-    else
-        date +%s%N | sha256sum | cut -c1-$((bytes * 2))
-    fi
-}
-
 # 生成随机密码
 rand_pass() {
-    if has_cmd openssl; then
-        openssl rand -base64 16 2>/dev/null | tr -d '\n\r'
-    else
-        head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r' || rand_hex 16
-    fi
+    openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'
 }
 
 # 生成UUID
 rand_uuid() {
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-    else
-        local h
-        h=$(rand_hex 16)
-        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
-    fi
+    cat /proc/sys/kernel/random/uuid
 }
 
 # -----------------------
@@ -420,10 +591,8 @@ get_config() {
         if [ -n "${SINGBOX_PORT_SS:-}" ]; then
             PORT_SS="$SINGBOX_PORT_SS"
         else
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
-            PORT_SS="${USER_PORT_SS:-$(rand_port)}"
+            PORT_SS="$(prompt_port "请输入 SS 端口" "$(rand_port_available)")"
         fi
-        echo "$PORT_SS" | grep -Eq '^[0-9]+$' && [ "$PORT_SS" -ge 1 ] && [ "$PORT_SS" -le 65535 ] || { err "SS 端口必须是 1-65535 的数字"; exit 1; }
         PSK_SS=$(rand_pass)
         info "SS 端口: $PORT_SS"
         info "SS 加密方式: $SS_METHOD"
@@ -435,10 +604,8 @@ get_config() {
         if [ -n "${SINGBOX_PORT_HY2:-}" ]; then
             PORT_HY2="$SINGBOX_PORT_HY2"
         else
-            read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
-            PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
+            PORT_HY2="$(prompt_port "请输入 HY2 端口" "$(rand_port_available)")"
         fi
-        echo "$PORT_HY2" | grep -Eq '^[0-9]+$' && [ "$PORT_HY2" -ge 1 ] && [ "$PORT_HY2" -le 65535 ] || { err "HY2 端口必须是 1-65535 的数字"; exit 1; }
         PSK_HY2=$(rand_pass)
         info "HY2 端口: $PORT_HY2"
         info "HY2 密码已自动生成"
@@ -449,10 +616,8 @@ get_config() {
         if [ -n "${SINGBOX_PORT_TUIC:-}" ]; then
             PORT_TUIC="$SINGBOX_PORT_TUIC"
         else
-            read -p "请输入 TUIC 端口(留空则随机 10000-60000): " USER_PORT_TUIC
-            PORT_TUIC="${USER_PORT_TUIC:-$(rand_port)}"
+            PORT_TUIC="$(prompt_port "请输入 TUIC 端口" "$(rand_port_available)")"
         fi
-        echo "$PORT_TUIC" | grep -Eq '^[0-9]+$' && [ "$PORT_TUIC" -ge 1 ] && [ "$PORT_TUIC" -le 65535 ] || { err "TUIC 端口必须是 1-65535 的数字"; exit 1; }
         PSK_TUIC=$(rand_pass)
         UUID_TUIC=$(rand_uuid)
         info "TUIC 端口: $PORT_TUIC"
@@ -464,10 +629,8 @@ get_config() {
         if [ -n "${SINGBOX_PORT_REALITY:-}" ]; then
             PORT_REALITY="$SINGBOX_PORT_REALITY"
         else
-            read -p "请输入 VLESS Reality 端口(留空则随机 10000-60000): " USER_PORT_REALITY
-            PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
+            PORT_REALITY="$(prompt_port "请输入 VLESS Reality 端口" "$(rand_port_available)")"
         fi
-        echo "$PORT_REALITY" | grep -Eq '^[0-9]+$' && [ "$PORT_REALITY" -ge 1 ] && [ "$PORT_REALITY" -le 65535 ] || { err "VLESS Reality 端口必须是 1-65535 的数字"; exit 1; }
         UUID=$(rand_uuid)
         info "VLESS Reality 端口: $PORT_REALITY"
         info "VLESS Reality UUID 已自动生成"
@@ -478,13 +641,13 @@ get_config() {
     if [ -n "${SINGBOX_PORT_ANYTLS:-}" ]; then
         PORT_ANYTLS="$SINGBOX_PORT_ANYTLS"
     else
-        read -p "请输入 AnyTLS Reality 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS
-        PORT_ANYTLS="${USER_PORT_ANYTLS:-$(rand_port)}"
+        PORT_ANYTLS="$(prompt_port "请输入 AnyTLS Reality 端口" "$(rand_port_available)")"
     fi
-    echo "$PORT_ANYTLS" | grep -Eq '^[0-9]+$' && [ "$PORT_ANYTLS" -ge 1 ] && [ "$PORT_ANYTLS" -le 65535 ] || { err "AnyTLS Reality 端口必须是 1-65535 的数字"; exit 1; }
 
-    ANYTLS_USER=$(rand_hex 4)
-    ANYTLS_PSK=$(rand_pass)
+    ANYTLS_USER=$(trim_spaces "$(openssl rand -hex 4)")
+    ANYTLS_PSK=$(trim_spaces "$(openssl rand -base64 16)")
+    assert_non_empty "$ANYTLS_USER" "AnyTLS 用户名" || exit 1
+    assert_non_empty "$ANYTLS_PSK" "AnyTLS 密码" || exit 1
 
     info "AnyTLS Reality 端口: $PORT_ANYTLS"
     info "AnyTLS Reality 用户名: $ANYTLS_USER"
@@ -496,14 +659,14 @@ get_config() {
         if [ -n "${SINGBOX_PORT_SOCKS:-}" ]; then
             PORT_SOCKS="$SINGBOX_PORT_SOCKS"
         else
-            read -p "请输入 SOCKS5 端口(留空则随机 10000-60000): " USER_PORT_SOCKS
-            PORT_SOCKS="${USER_PORT_SOCKS:-$(rand_port)}"
+            PORT_SOCKS="$(prompt_port "请输入 SOCKS5 端口" "$(rand_port_available)")"
         fi
-        echo "$PORT_SOCKS" | grep -Eq '^[0-9]+$' && [ "$PORT_SOCKS" -ge 1 ] && [ "$PORT_SOCKS" -le 65535 ] || { err "SOCKS5 端口必须是 1-65535 的数字"; exit 1; }
         read -p "请输入 SOCKS5 用户名(留空自动生成): " USER_SOCKS_USERNAME
         read -p "请输入 SOCKS5 密码(留空自动生成): " USER_SOCKS_PASSWORD
-        SOCKS_USERNAME="${USER_SOCKS_USERNAME:-socks$(rand_hex 2)}"
-        SOCKS_PASSWORD="${USER_SOCKS_PASSWORD:-$(rand_pass)}"
+        SOCKS_USERNAME="$(trim_spaces "${USER_SOCKS_USERNAME:-socks$(openssl rand -hex 2)}")"
+        SOCKS_PASSWORD="$(trim_spaces "${USER_SOCKS_PASSWORD:-$(rand_pass)}")"
+        assert_non_empty "$SOCKS_USERNAME" "SOCKS5 用户名" || exit 1
+        assert_non_empty "$SOCKS_PASSWORD" "SOCKS5 密码" || exit 1
         info "SOCKS5 端口: $PORT_SOCKS"
         info "SOCKS5 用户名: $SOCKS_USERNAME"
         info "SOCKS5 密码已设置"
@@ -513,6 +676,35 @@ get_config() {
 }
 
 get_config
+
+ensure_supported_arch() {
+    local arch=""
+    if command -v dpkg >/dev/null 2>&1; then
+        arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    fi
+    arch="${arch:-$(uname -m 2>/dev/null || true)}"
+    case "$arch" in
+        amd64|x86_64|arm64|aarch64) return 0 ;;
+        *) err "当前架构暂未在脚本中验证：$arch"; return 1 ;;
+    esac
+}
+
+run_remote_install_script_ipv4() {
+    local tmp_script
+    tmp_script="$(mktemp /tmp/singbox-install.XXXXXX.sh)" || { err "创建临时安装脚本失败"; return 1; }
+    info "下载 sing-box 安装脚本（IPv4 优先）..."
+    if ! curl ${CURL_IPV4_OPTS} ${CURL_RETRY_OPTS} -fsSL https://sing-box.app/install.sh -o "$tmp_script"; then
+        rm -f "$tmp_script"
+        err "下载 sing-box 安装脚本失败"
+        return 1
+    fi
+    sed -i 's/curl /curl -4 /g; s/wget /wget -4 /g; s/apt-get /apt-get -o Acquire::ForceIPv4=true /g; s/apt /apt -o Acquire::ForceIPv4=true /g' "$tmp_script" || true
+    chmod +x "$tmp_script"
+    bash "$tmp_script"
+    local rc=$?
+    rm -f "$tmp_script"
+    return $rc
+}
 
 # -----------------------
 # 安装 sing-box
@@ -529,6 +721,8 @@ install_singbox() {
         fi
     fi
 
+    ensure_supported_arch || exit 1
+
     case "$OS" in
         alpine)
             info "使用 Edge 仓库安装 sing-box"
@@ -539,8 +733,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            ensure_fetcher
-            bash <(fetch "https://sing-box.app/install.sh") || {
+            run_remote_install_script_ipv4 || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -551,6 +744,7 @@ install_singbox() {
             ;;
     esac
 
+    set_sb_bin
     if ! command -v sing-box >/dev/null 2>&1; then
         err "sing-box 安装后未找到可执行文件"
         exit 1
@@ -650,7 +844,7 @@ create_config() {
         cat >> "$TEMP_INBOUNDS" <<'INBOUND_SS'
     {
       "type": "shadowsocks",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_SS_PLACEHOLDER,
       "method": "METHOD_SS_PLACEHOLDER",
       "password": "PSK_SS_PLACEHOLDER",
@@ -669,7 +863,7 @@ INBOUND_SS
     {
       "type": "hysteria2",
       "tag": "hy2-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_HY2_PLACEHOLDER,
       "users": [
         {
@@ -695,7 +889,7 @@ INBOUND_HY2
     {
       "type": "tuic",
       "tag": "tuic-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_TUIC_PLACEHOLDER,
       "users": [
         {
@@ -724,12 +918,11 @@ INBOUND_TUIC
     {
       "type": "vless",
       "tag": "vless-in-1",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_REALITY_PLACEHOLDER,
       "users": [
         {
-          "uuid": "UUID_REALITY_PLACEHOLDER",
-          "flow": "xtls-rprx-vision"
+          "uuid": "UUID_REALITY_PLACEHOLDER"
         }
       ],
       "tls": {
@@ -761,7 +954,7 @@ INBOUND_REALITY
     {
       "type": "anytls",
       "tag": "anytls-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_ANYTLS_PLACEHOLDER,
       "users": [
         {
@@ -804,7 +997,7 @@ INBOUND_ANYTLS
     {
       "type": "socks",
       "tag": "socks-in-1",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": PORT_SOCKS_PLACEHOLDER,
       "users": [
         {
@@ -897,9 +1090,13 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
+    if sing-box check -c "$CONFIG_PATH"; then
+        info "配置文件验证通过"
+    else
+        err "配置文件验证失败，已停止安装"
+        err "请检查上面的 sing-box 校验输出"
+        exit 1
+    fi
 
     # 保存配置缓存（追加/覆盖）
     cat > /etc/sing-box/.config_cache <<CACHEEOF
@@ -960,24 +1157,74 @@ info "配置生成完成，准备设置服务..."
 
 # -----------------------
 # 设置服务
+start_process_service() {
+    set_sb_bin
+    mkdir -p /etc/sing-box /var/log /run
+    [ -x "$SB_BIN" ] || { err "未找到 sing-box 可执行文件: $SB_BIN"; return 1; }
+    if [ -f "$SB_PID_FILE" ]; then
+        local old_pid
+        old_pid="$(cat "$SB_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f "$SB_PID_FILE"
+    fi
+    nohup "$SB_BIN" run -c /etc/sing-box/config.json >>"$SB_LOG_FILE" 2>>"$SB_ERR_FILE" &
+    echo $! > "$SB_PID_FILE"
+    sleep 2
+    if kill -0 "$(cat "$SB_PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null; then
+        return 0
+    fi
+    tail -20 "$SB_ERR_FILE" 2>/dev/null || tail -20 "$SB_LOG_FILE" 2>/dev/null || true
+    return 1
+}
+
+stop_process_service() {
+    if [ ! -f "$SB_PID_FILE" ]; then
+        return 0
+    fi
+    local pid
+    pid="$(cat "$SB_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SB_PID_FILE"
+}
+
+process_service_status() {
+    if [ -f "$SB_PID_FILE" ] && kill -0 "$(cat "$SB_PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 setup_service() {
     info "配置系统服务..."
-    
-    if [ "$OS" = "alpine" ]; then
+    mkdir -p /etc/sing-box /var/log /run
+    set_sb_bin
+    if ! "$SB_BIN" check -c /etc/sing-box/config.json; then
+        err "配置文件验证失败，已停止安装"
+        err "请检查上面的 sing-box 校验输出"
+        exit 1
+    fi
+
+    if [ "$SERVICE_BACKEND" = "openrc" ]; then
         SERVICE_PATH="/etc/init.d/sing-box"
-        
-        cat > "$SERVICE_PATH" <<'OPENRC'
+
+        cat > "$SERVICE_PATH" <<OPENRC
 #!/sbin/openrc-run
 
 name="sing-box"
 description="Sing-box Proxy Server"
-command="/usr/bin/sing-box"
+command="$SB_BIN"
 command_args="run -c /etc/sing-box/config.json"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/\${RC_SVCNAME}.pid"
 command_background="yes"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.err"
-# 自动拉起（程序崩溃、OOM、被 kill 后自动恢复）
+output_log="$SB_LOG_FILE"
+error_log="$SB_ERR_FILE"
 supervisor=supervise-daemon
 supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
 
@@ -991,15 +1238,14 @@ start_pre() {
     checkpath --directory --mode 0755 /run
 }
 OPENRC
-        
+
         chmod +x "$SERVICE_PATH"
         rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
         rc-service sing-box restart || {
             err "服务启动失败"
-            tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
+            tail -20 "$SB_ERR_FILE" 2>/dev/null || tail -20 "$SB_LOG_FILE" 2>/dev/null || true
             exit 1
         }
-        
         sleep 2
         if rc-service sing-box status >/dev/null 2>&1; then
             info "✅ OpenRC 服务已启动"
@@ -1007,23 +1253,22 @@ OPENRC
             err "服务状态异常"
             exit 1
         fi
-        
-    else
+    elif [ "$SERVICE_BACKEND" = "systemd" ]; then
         SERVICE_PATH="/etc/systemd/system/sing-box.service"
-        
-        cat > "$SERVICE_PATH" <<'SYSTEMD'
+
+        cat > "$SERVICE_PATH" <<SYSTEMD
 [Unit]
 Description=Sing-box Proxy Server
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-Wants=network.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/etc/sing-box
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=$SB_BIN run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=1048576
@@ -1031,24 +1276,32 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
-        
+
         systemctl daemon-reload
-        systemctl enable sing-box >/dev/null 2>&1
+        systemctl enable sing-box >/dev/null 2>&1 || warn "添加开机自启失败"
         systemctl restart sing-box || {
             err "服务启动失败"
-            journalctl -u sing-box -n 30 --no-pager
+            journalctl -u sing-box -n 50 --no-pager || true
             exit 1
         }
-        
         sleep 2
         if systemctl is-active sing-box >/dev/null 2>&1; then
             info "✅ Systemd 服务已启动"
         else
             err "服务状态异常"
+            journalctl -u sing-box -n 50 --no-pager || true
             exit 1
         fi
+    else
+        SERVICE_PATH="process:$SB_PID_FILE"
+        warn "当前为 Debian 容器/非 systemd 环境，使用轻量进程模式运行 sing-box"
+        start_process_service || {
+            err "进程模式启动失败"
+            exit 1
+        }
+        info "✅ 进程模式已启动"
     fi
-    
+
     info "服务配置完成: $SERVICE_PATH"
 }
 
@@ -1059,34 +1312,18 @@ setup_service
 get_public_ip() {
     local ip=""
     for url in \
-        "https://api4.ipify.org" \
-        "https://api64.ipify.org" \
         "https://api.ipify.org" \
-        "https://ident.me" \
         "https://ipinfo.io/ip" \
         "https://ifconfig.me" \
         "https://icanhazip.com" \
-        "https://ipecho.net/plain" \
-        "https://api6.ipify.org" \
-        "https://v6.ident.me"; do
-        ip=$(fetch "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ]; then
+        "https://ipecho.net/plain"; do
+        ip=$(curl ${CURL_IPV4_OPTS} -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
             return 0
         fi
     done
     return 1
-}
-
-format_host_for_uri() {
-    local host="$1"
-    if [[ "$host" == \[*\] ]]; then
-        echo "$host"
-    elif [[ "$host" == *:* ]]; then
-        echo "[$host]"
-    else
-        echo "$host"
-    fi
 }
 
 # 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
@@ -1106,8 +1343,6 @@ fi
 # 生成链接(仅生成已选择的协议)
 generate_uris() {
     local host="$PUB_IP"
-    local uri_host
-    uri_host=$(format_host_for_uri "$host")
     
     if $ENABLE_SS; then
         local ss_userinfo="${SS_METHOD}:${PSK_SS}"
@@ -1115,28 +1350,28 @@ generate_uris() {
         ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
 
         echo "=== Shadowsocks (SS) ==="
-        echo "ss://${ss_encoded}@${uri_host}:${PORT_SS}#ss${suffix}"
-        echo "ss://${ss_b64}@${uri_host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
+        echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
         echo ""
     fi
     
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
         echo ""
     fi
 
     if $ENABLE_TUIC; then
         tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== TUIC ==="
-        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
+        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
         echo ""
     fi
     
     if $ENABLE_REALITY; then
         echo "=== VLESS Reality ==="
-        echo "vless://${UUID}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
+        echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&security=reality&type=tcp&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
         echo ""
     fi
 
@@ -1144,7 +1379,7 @@ generate_uris() {
         anytls_user_encoded=$(printf "%s" "$ANYTLS_USER" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         anytls_pass_encoded=$(printf "%s" "$ANYTLS_PSK" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== AnyTLS Reality ==="
-        echo "anytls://${anytls_pass_encoded}@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
+        echo "anytls://${anytls_pass_encoded}@${host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
         echo ""
     fi
 
@@ -1152,7 +1387,7 @@ generate_uris() {
         socks_user_encoded=$(printf "%s" "$SOCKS_USERNAME" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         socks_pass_encoded=$(printf "%s" "$SOCKS_PASSWORD" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== SOCKS5 ==="
-        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${uri_host}:${PORT_SOCKS}#socks${suffix}"
+        echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${host}:${PORT_SOCKS}#socks${suffix}"
         echo "${host}:${PORT_SOCKS} 用户名=${SOCKS_USERNAME} 密码=${SOCKS_PASSWORD}"
         echo ""
     fi
@@ -1186,18 +1421,23 @@ generate_uris | while IFS= read -r line; do
 done
 echo ""
 info "🔧 管理命令:"
-if [ "$OS" = "alpine" ]; then
+if [ "$SERVICE_BACKEND" = "openrc" ]; then
     echo "   启动: rc-service sing-box start"
     echo "   停止: rc-service sing-box stop"
     echo "   重启: rc-service sing-box restart"
     echo "   状态: rc-service sing-box status"
-    echo "   日志: tail -f /var/log/sing-box.log"
-else
+    echo "   日志: tail -f $SB_LOG_FILE"
+elif [ "$SERVICE_BACKEND" = "systemd" ]; then
     echo "   启动: systemctl start sing-box"
     echo "   停止: systemctl stop sing-box"
     echo "   重启: systemctl restart sing-box"
     echo "   状态: systemctl status sing-box"
     echo "   日志: journalctl -u sing-box -f"
+else
+    echo "   启动: sb -> 服务管理 -> 查看服务状态/更新；首次安装已自动后台运行"
+    echo "   停止: kill $(cat $SB_PID_FILE 2>/dev/null)"
+    echo "   状态: ps -fp $(cat $SB_PID_FILE 2>/dev/null)"
+    echo "   日志: tail -f $SB_LOG_FILE"
 fi
 echo ""
 echo "=========================================="
@@ -1215,75 +1455,9 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-APT_UPDATED=0
-
-apt_update_once() {
-    case "$OS" in
-        debian)
-            if [ "${APT_UPDATED:-0}" -eq 0 ]; then
-                apt-get update -y || { err "apt update 失败"; return 1; }
-                APT_UPDATED=1
-            fi
-            ;;
-    esac
-}
-
-fetch() {
-    local url="$1"
-    if has_cmd curl; then
-        curl -fsSL --connect-timeout 5 "$url"
-    elif has_cmd wget; then
-        wget -qO- --timeout=5 "$url"
-    else
-        return 127
-    fi
-}
-
-ensure_fetcher() {
-    if has_cmd curl || has_cmd wget; then
-        return 0
-    fi
-    case "$OS" in
-        alpine)
-            apk add --no-cache wget || { err "下载器安装失败"; return 1; }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt_update_once || return 1
-            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 wget || { err "下载器安装失败"; return 1; }
-            ;;
-        redhat)
-            yum install -y wget || { err "下载器安装失败"; return 1; }
-            ;;
-        *)
-            err "未识别的系统类型，且未找到 curl/wget"
-            return 1
-            ;;
-    esac
-}
-
-ensure_jq() {
-    has_cmd jq && return 0
-    info "需要 jq 才能编辑 sing-box 配置，开始按需安装..."
-    case "$OS" in
-        alpine)
-            apk add --no-cache jq || { err "jq 安装失败"; return 1; }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt_update_once || return 1
-            apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 jq || { err "jq 安装失败"; return 1; }
-            ;;
-        redhat)
-            yum install -y jq || { err "jq 安装失败"; return 1; }
-            ;;
-        *)
-            err "未识别的系统类型，请手动安装 jq"
-            return 1
-            ;;
-    esac
-}
+APT_IPV4_OPTS="-o Acquire::ForceIPv4=true"
+CURL_IPV4_OPTS="-4"
+CURL_RETRY_OPTS="--retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120"
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
@@ -1291,6 +1465,189 @@ PROTOCOL_FILE="/etc/sing-box/.protocols"
 SERVICE_NAME="sing-box"
 REALITY_PUB_FILE="/etc/sing-box/.reality_pub"
 URI_FILE="/etc/sing-box/uris.txt"
+DEFAULT_LISTEN="0.0.0.0"
+SB_PID_FILE="/run/sing-box.pid"
+SB_LOG_FILE="/var/log/sing-box.log"
+SB_ERR_FILE="/var/log/sing-box.err"
+SERVICE_BACKEND=""
+HAS_SYSTEMD=false
+IS_CONTAINER=false
+SB_BIN=""
+
+trim_spaces() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+assert_non_empty() {
+    local value="$1"
+    local field_name="$2"
+    if [ -z "$value" ]; then
+        err "${field_name} 不能为空"
+        return 1
+    fi
+}
+
+is_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+port_in_use_in_config() {
+    local port="$1"
+    local exclude_tag="${2:-}"
+    if [ -n "$exclude_tag" ]; then
+        jq -e --argjson port "$port" --arg tag "$exclude_tag" ' .inbounds[]? | select((.listen_port == $port) and (.tag != $tag))' "$CONFIG_PATH" >/dev/null 2>&1
+    else
+        jq -e --argjson port "$port" ' .inbounds[]? | select(.listen_port == $port)' "$CONFIG_PATH" >/dev/null 2>&1
+    fi
+}
+
+assert_port_available() {
+    local port="$1"
+    local exclude_tag="${2:-}"
+    if ! is_valid_port "$port"; then
+        err "端口无效：$port，必须为 1-65535 的数字"
+        return 1
+    fi
+    if port_in_use_in_config "$port" "$exclude_tag"; then
+        err "端口已被现有配置占用：$port"
+        return 1
+    fi
+}
+
+rand_port_available() {
+    local port
+    local i=0
+    while [ $i -lt 30 ]; do
+        port=$(shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)))
+        if ! port_in_use_in_config "$port"; then
+            echo "$port"
+            return 0
+        fi
+        i=$((i+1))
+    done
+    err "无法生成可用随机端口"
+    return 1
+}
+
+prompt_port() {
+    local prompt_text="$1"
+    local default_port="${2:-}"
+    local exclude_tag="${3:-}"
+    local input
+    while true; do
+        if [ -n "$default_port" ]; then
+            read -p "${prompt_text}(回车默认 ${default_port}): " input
+            input="${input:-$default_port}"
+        else
+            read -p "${prompt_text}: " input
+        fi
+        input="$(trim_spaces "$input")"
+        if assert_port_available "$input" "$exclude_tag"; then
+            printf '%s\n' "$input"
+            return 0
+        fi
+    done
+}
+
+is_valid_sni() {
+    local sni="$1"
+    [ -n "$sni" ] || return 1
+    [ "${#sni}" -le 253 ] || return 1
+    [[ "$sni" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$sni" == *.* ]] || return 1
+    [[ ! "$sni" =~ ^[.-] ]] || return 1
+    [[ ! "$sni" =~ [.-]$ ]] || return 1
+    [[ "$sni" != *..* ]] || return 1
+}
+
+assert_valid_sni() {
+    local sni="$1"
+    if ! is_valid_sni "$sni"; then
+        err "SNI 无效：$sni"
+        return 1
+    fi
+}
+
+url_decode() {
+    local data="$1"
+    data="${data//+/ }"
+    printf '%b' "${data//%/\x}"
+}
+
+decode_base64_compat() {
+    local data="$1"
+    local mod padded
+    data="${data//-/+}"
+    data="${data//_//}"
+    mod=$(( ${#data} % 4 ))
+    padded="$data"
+    if [ "$mod" -eq 2 ]; then
+        padded="${data}=="
+    elif [ "$mod" -eq 3 ]; then
+        padded="${data}="
+    elif [ "$mod" -eq 1 ]; then
+        return 1
+    fi
+    printf '%s' "$padded" | base64 -d 2>/dev/null
+}
+
+parse_ss_uri() {
+    local uri="$1"
+    local body userinfo hostport decoded method password host port
+    PARSED_SS_SERVER=""
+    PARSED_SS_PORT=""
+    PARSED_SS_METHOD=""
+    PARSED_SS_PASSWORD=""
+
+    uri="$(trim_spaces "$uri")"
+    [[ "$uri" == ss://* ]] || { err "不是有效的 SS 链接"; return 1; }
+    body="${uri#ss://}"
+    body="${body%%#*}"
+    body="${body%%\?*}"
+    echo "$body" | grep -q 'plugin=' && { err "当前中转模式不支持带 plugin 的 SS 链接"; return 1; }
+    [[ "$body" == *@* ]] || { err "SS 链接缺少主机和端口"; return 1; }
+
+    userinfo="${body%@*}"
+    hostport="${body##*@}"
+    userinfo="$(url_decode "$userinfo")"
+
+    if [[ "$userinfo" == *:* ]]; then
+        method="${userinfo%%:*}"
+        password="${userinfo#*:}"
+    else
+        decoded="$(decode_base64_compat "$userinfo" 2>/dev/null || true)"
+        [ -n "$decoded" ] || { err "SS 链接用户信息 base64 解码失败"; return 1; }
+        decoded="$(url_decode "$decoded")"
+        [[ "$decoded" == *:* ]] || { err "SS 链接缺少 method:password"; return 1; }
+        method="${decoded%%:*}"
+        password="${decoded#*:}"
+    fi
+
+    if [[ "$hostport" =~ ^\[(.*)\]:(.+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+    fi
+
+    host="$(trim_spaces "$host")"
+    port="$(trim_spaces "$port")"
+    method="$(trim_spaces "$method")"
+
+    [ -n "$host" ] || { err "SS 链接中的服务器地址为空"; return 1; }
+    is_valid_port "$port" || { err "SS 链接中的端口无效：$port"; return 1; }
+    [ -n "$method" ] || { err "SS 链接中的加密方式为空"; return 1; }
+    [ -n "$password" ] || { err "SS 链接中的密码为空"; return 1; }
+
+    PARSED_SS_SERVER="$host"
+    PARSED_SS_PORT="$port"
+    PARSED_SS_METHOD="$method"
+    PARSED_SS_PASSWORD="$password"
+    return 0
+}
 
 REALITY_TAGS=()
 REALITY_PORTS=()
@@ -1321,57 +1678,98 @@ detect_os() {
 
 detect_os
 
-service_start() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"; }
-service_stop() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"; }
-service_restart() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"; }
-service_status() { [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager; }
-service_status_pause() {
-    service_status
-    echo
-    read -r -p "按回车返回菜单..." _
+is_container_env() {
+    [ -f /.dockerenv ] && return 0
+    [ -f /run/.containerenv ] && return 0
+    grep -qaE '(docker|lxc|containerd|kubepods|podman|openvz)' /proc/1/cgroup 2>/dev/null && return 0
+    return 1
 }
+
+has_working_systemd() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]')" = "systemd" ] || return 1
+    systemctl list-unit-files >/dev/null 2>&1 || return 1
+    return 0
+}
+
+setup_runtime_env() {
+    if is_container_env; then
+        IS_CONTAINER=true
+    fi
+    if has_working_systemd; then
+        HAS_SYSTEMD=true
+        SERVICE_BACKEND="systemd"
+    elif [ "$OS" = "alpine" ]; then
+        SERVICE_BACKEND="openrc"
+    else
+        SERVICE_BACKEND="process"
+    fi
+}
+
+set_sb_bin() {
+    SB_BIN="$(command -v sing-box 2>/dev/null || true)"
+    [ -n "$SB_BIN" ] || SB_BIN="/usr/bin/sing-box"
+}
+
+start_process_service() {
+    set_sb_bin
+    mkdir -p /var/log /run
+    if [ -f "$SB_PID_FILE" ]; then
+        local old_pid
+        old_pid="$(cat "$SB_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f "$SB_PID_FILE"
+    fi
+    nohup "$SB_BIN" run -c "$CONFIG_PATH" >>"$SB_LOG_FILE" 2>>"$SB_ERR_FILE" &
+    echo $! > "$SB_PID_FILE"
+    sleep 2
+    kill -0 "$(cat "$SB_PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null
+}
+
+stop_process_service() {
+    if [ ! -f "$SB_PID_FILE" ]; then
+        return 0
+    fi
+    local pid
+    pid="$(cat "$SB_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SB_PID_FILE"
+}
+
+process_service_status() {
+    if [ -f "$SB_PID_FILE" ] && kill -0 "$(cat "$SB_PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null; then
+        echo "sing-box 进程运行中: PID $(cat "$SB_PID_FILE")"
+        return 0
+    fi
+    echo "sing-box 进程未运行"
+    return 1
+}
+
+setup_runtime_env
+
+service_start() { [ "$SERVICE_BACKEND" = "openrc" ] && rc-service "$SERVICE_NAME" start || { [ "$SERVICE_BACKEND" = "systemd" ] && systemctl start "$SERVICE_NAME" || start_process_service; }; }
+service_stop() { [ "$SERVICE_BACKEND" = "openrc" ] && rc-service "$SERVICE_NAME" stop || { [ "$SERVICE_BACKEND" = "systemd" ] && systemctl stop "$SERVICE_NAME" || stop_process_service; }; }
+service_restart() { [ "$SERVICE_BACKEND" = "openrc" ] && rc-service "$SERVICE_NAME" restart || { [ "$SERVICE_BACKEND" = "systemd" ] && systemctl restart "$SERVICE_NAME" || start_process_service; }; }
+service_status() { [ "$SERVICE_BACKEND" = "openrc" ] && rc-service "$SERVICE_NAME" status || { [ "$SERVICE_BACKEND" = "systemd" ] && systemctl status "$SERVICE_NAME" --no-pager || process_service_status; }; }
 
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
-rand_hex() {
-    local bytes="${1:-16}"
-    if has_cmd openssl; then
-        openssl rand -hex "$bytes" 2>/dev/null
-    elif [ -r /dev/urandom ] && has_cmd od; then
-        od -An -N"$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
-    else
-        date +%s%N | sha256sum | cut -c1-$((bytes * 2))
-    fi
-}
-rand_pass() {
-    if has_cmd openssl; then
-        openssl rand -base64 16 2>/dev/null | tr -d '\n\r'
-    else
-        head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r' || rand_hex 16
-    fi
-}
-rand_uuid() {
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-    else
-        local h
-        h=$(rand_hex 16)
-        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
-    fi
-}
-rand_sid() { rand_hex 4; }
-
-ensure_valid_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
-}
+rand_pass() { openssl rand -base64 16 2>/dev/null | tr -d '\n\r' || head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r'; }
+rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
+rand_sid() { openssl rand -hex 4 2>/dev/null || echo "01234567"; }
 
 url_encode() {
     printf "%s" "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'
 }
 
 need_config() {
-    ensure_jq || return 1
     if [ ! -f "$CONFIG_PATH" ]; then
         err "未找到配置文件: $CONFIG_PATH"
         return 1
@@ -1448,8 +1846,9 @@ backup_config() { cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"; }
 rollback_config() { [ -f "${CONFIG_PATH}.bak" ] && mv "${CONFIG_PATH}.bak" "$CONFIG_PATH"; }
 
 validate_and_restart() {
+    set_sb_bin
     if command -v sing-box >/dev/null 2>&1; then
-        if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        if ! "$SB_BIN" check -c "$CONFIG_PATH" >/dev/null 2>&1; then
             rollback_config
             err "配置校验失败，已回滚"
             return 1
@@ -1638,22 +2037,22 @@ select_tag_from_list() {
     local tags=("$@")
     local count="${#tags[@]}"
     [ "$count" -gt 0 ] || return 1
-    echo >&2
-    echo "$title" >&2
+    echo
+    echo "$title"
     local i
     for ((i=0; i<count; i++)); do
-        echo "$((i+1))) ${tags[$i]}" >&2
+        echo "$((i+1))) ${tags[$i]}"
     done
     while true; do
-        read -r -p "请选择编号: " choice
+        read -p "请选择编号: " choice
         case "$choice" in
-            ''|*[!0-9]*) warn "请输入数字编号" >&2 ;;
+            ''|*[!0-9]*) warn "请输入数字编号" ;;
             *)
                 if [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
-                    printf '%s\n' "${tags[$((choice-1))]}"
+                    echo "${tags[$((choice-1))]}"
                     return 0
                 fi
-                warn "编号超出范围" >&2
+                warn "编号超出范围"
                 ;;
         esac
     done
@@ -1661,36 +2060,16 @@ select_tag_from_list() {
 
 get_public_ip() {
     local ip=""
-    for url in \
-        "https://api4.ipify.org" \
-        "https://api64.ipify.org" \
-        "https://api.ipify.org" \
-        "https://ident.me" \
-        "https://ipinfo.io/ip" \
-        "https://ifconfig.me" \
-        "https://api6.ipify.org" \
-        "https://v6.ident.me"; do
-        ip=$(fetch "$url" 2>/dev/null | tr -d '[:space:]')
+    for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
+        ip=$(curl ${CURL_IPV4_OPTS} -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
         [ -n "$ip" ] && echo "$ip" && return 0
     done
     echo "YOUR_SERVER_IP"
 }
 
-format_host_for_uri() {
-    local host="$1"
-    if [[ "$host" == \[*\] ]]; then
-        echo "$host"
-    elif [[ "$host" == *:* ]]; then
-        echo "[$host]"
-    else
-        echo "$host"
-    fi
-}
-
 generate_uris() {
     read_config || return 1
     if [ -n "${CUSTOM_IP:-}" ]; then PUBLIC_IP="$CUSTOM_IP"; else PUBLIC_IP=$(get_public_ip); fi
-    URI_HOST=$(format_host_for_uri "$PUBLIC_IP")
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     : > "$URI_FILE"
 
@@ -1701,8 +2080,8 @@ generate_uris() {
             ss_userinfo="${SS_METHODS[$i]}:${SS_PSKS[$i]}"
             ss_encoded=$(url_encode "$ss_userinfo")
             ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-            echo "ss://${ss_encoded}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
-            echo "ss://${ss_b64}@${URI_HOST}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORTS[$i]}#${SS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1712,7 +2091,7 @@ generate_uris() {
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
         for ((i=0; i<HY2_COUNT; i++)); do
             hy2_encoded=$(url_encode "${HY2_PSKS[$i]}")
-            echo "hy2://${hy2_encoded}@${URI_HOST}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORTS[$i]}/?sni=www.bing.com&alpn=h3&insecure=1#${HY2_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1722,7 +2101,7 @@ generate_uris() {
         echo "=== TUIC ===" >> "$URI_FILE"
         for ((i=0; i<TUIC_COUNT; i++)); do
             tuic_encoded=$(url_encode "${TUIC_PSKS[$i]}")
-            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${URI_HOST}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "tuic://${TUIC_UUIDS[$i]}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORTS[$i]}?congestion_control=bbr&udp_relay_mode=native&sni=www.bing.com&alpn=h3&allow_insecure=1#${TUIC_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1732,7 +2111,7 @@ generate_uris() {
         if [ "$REALITY_COUNT" -gt 0 ]; then
             echo "=== VLESS Reality ===" >> "$URI_FILE"
             for ((i=0; i<REALITY_COUNT; i++)); do
-                echo "vless://${REALITY_UUIDS[$i]}@${URI_HOST}:${REALITY_PORTS[$i]}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+                echo "vless://${REALITY_UUIDS[$i]}@${PUBLIC_IP}:${REALITY_PORTS[$i]}?encryption=none&security=reality&type=tcp&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SIDS[$i]}#${REALITY_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             done
             echo >> "$URI_FILE"
         fi
@@ -1743,7 +2122,7 @@ generate_uris() {
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
         for ((i=0; i<ANYTLS_COUNT; i++)); do
             anytls_encoded=$(url_encode "${ANYTLS_PSKS[$i]}")
-            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${URI_HOST}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "anytls://${ANYTLS_USERS[$i]}:${anytls_encoded}@${PUBLIC_IP}:${ANYTLS_PORTS[$i]}?sni=${REALITY_SNI}&insecure=1#${ANYTLS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
     fi
@@ -1754,7 +2133,7 @@ generate_uris() {
         for ((i=0; i<SOCKS_COUNT; i++)); do
             socks_user_encoded=$(url_encode "${SOCKS_USERS[$i]}")
             socks_pass_encoded=$(url_encode "${SOCKS_PASSWORDS[$i]}")
-            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${URI_HOST}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
+            echo "socks5://${socks_user_encoded}:${socks_pass_encoded}@${PUBLIC_IP}:${SOCKS_PORTS[$i]}#${SOCKS_TAGS[$i]}${node_suffix}" >> "$URI_FILE"
             echo "${SOCKS_TAGS[$i]} => ${PUBLIC_IP}:${SOCKS_PORTS[$i]} 用户名=${SOCKS_USERS[$i]} 密码=${SOCKS_PASSWORDS[$i]}" >> "$URI_FILE"
         done
         echo >> "$URI_FILE"
@@ -1807,28 +2186,8 @@ apply_relay_settings() {
     validate_and_restart
 }
 
-action_view_uri() {
-    info "正在生成并显示 URI..."
-    generate_uris || { err "生成 URI 失败"; return 1; }
-    echo
-    cat "$URI_FILE"
-    echo
-    read -r -p "按回车返回菜单..." _
-}
-
-action_regenerate_uri() {
-    generate_uris || { err "生成 URI 失败"; return 1; }
-    echo
-    cat "$URI_FILE"
-    echo
-    read -r -p "按回车返回菜单..." _
-}
-
-action_view_config() {
-    echo "$CONFIG_PATH"
-    echo
-    read -r -p "按回车返回菜单..." _
-}
+action_view_uri() { info "正在生成并显示 URI..."; generate_uris || { err "生成 URI 失败"; return 1; }; echo; cat "$URI_FILE"; }
+action_view_config() { echo "$CONFIG_PATH"; }
 
 action_edit_config() {
     [ -f "$CONFIG_PATH" ] || { err "配置文件不存在: $CONFIG_PATH"; return 1; }
@@ -1850,9 +2209,7 @@ action_reset_ss() {
     [ "$SS_COUNT" -gt 0 ] || { err "SS 协议未启用"; return 1; }
     target_tag=$(select_tag_from_list "当前 SS 列表：" "${SS_TAGS[@]}") || return 1
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    read -p "输入新的 SS 端口(回车保持 ${current_port}): " new_port
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 SS 端口" "$current_port" "$target_tag")" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1860,15 +2217,13 @@ action_reset_ss() {
 
 action_add_ss() {
     read_config || return 1
-    read -p "输入 SS 端口(留空随机 10000-60000): " new_port
+    new_port="$(prompt_port "输入 SS 端口" "$(rand_port_available)")" || return 1
     read -p "输入 SS 加密方式(默认 2022-blake3-aes-128-gcm): " new_method
     read -p "输入 SS 密码(留空自动生成): " new_psk
-    new_port="${new_port:-$(rand_port)}"
     new_method="${new_method:-2022-blake3-aes-128-gcm}"
     new_psk="${new_psk:-$(rand_pass)}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "ss-in")
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:$tag}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg method "$new_method" --arg psk "$new_psk" '{type:"shadowsocks",listen:"0.0.0.0",listen_port:$port,method:$method,password:$psk,tag:$tag}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_SS true
@@ -1893,9 +2248,7 @@ action_reset_hy2() {
     [ "$HY2_COUNT" -gt 0 ] || { err "HY2 协议未启用"; return 1; }
     target_tag=$(select_tag_from_list "当前 HY2 列表：" "${HY2_TAGS[@]}") || return 1
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    read -p "输入新的 HY2 端口(回车保持 ${current_port}): " new_port
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 HY2 端口" "$current_port" "$target_tag")" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1903,13 +2256,11 @@ action_reset_hy2() {
 
 action_add_hy2() {
     read_config || return 1
-    read -p "输入 HY2 端口(留空随机 10000-60000): " new_port
+    new_port="$(prompt_port "输入 HY2 端口" "$(rand_port_available)")" || return 1
     read -p "输入 HY2 密码(留空自动生成): " new_psk
-    new_port="${new_port:-$(rand_port)}"
     new_psk="${new_psk:-$(rand_pass)}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "hy2-in")
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:$tag,listen:"::",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg psk "$new_psk" '{type:"hysteria2",tag:$tag,listen:"0.0.0.0",listen_port:$port,users:[{password:$psk}],masquerade:"https://bing.com",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_HY2 true
@@ -1934,9 +2285,7 @@ action_reset_tuic() {
     [ "$TUIC_COUNT" -gt 0 ] || { err "TUIC 协议未启用"; return 1; }
     target_tag=$(select_tag_from_list "当前 TUIC 列表：" "${TUIC_TAGS[@]}") || return 1
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    read -p "输入新的 TUIC 端口(回车保持 ${current_port}): " new_port
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 TUIC 端口" "$current_port" "$target_tag")" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -1944,15 +2293,13 @@ action_reset_tuic() {
 
 action_add_tuic() {
     read_config || return 1
-    read -p "输入 TUIC 端口(留空随机 10000-60000): " new_port
+    new_port="$(prompt_port "输入 TUIC 端口" "$(rand_port_available)")" || return 1
     read -p "输入 TUIC UUID(留空自动生成): " new_uuid
     read -p "输入 TUIC 密码(留空自动生成): " new_psk
-    new_port="${new_port:-$(rand_port)}"
     new_uuid="${new_uuid:-$(rand_uuid)}"
     new_psk="${new_psk:-$(rand_pass)}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
     new_tag=$(next_protocol_tag "tuic-in")
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg psk "$new_psk" '{type:"tuic",tag:$tag,listen:"0.0.0.0",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_TUIC true
@@ -1981,22 +2328,20 @@ action_list_reality() {
         echo "$((i+1))) ${REALITY_TAGS[$i]} | port: ${REALITY_PORTS[$i]} | uuid: ${REALITY_UUIDS[$i]} | sid: ${REALITY_SIDS[$i]}"
     done
     echo
-    read -r -p "按回车返回菜单..." _
 }
 
 action_add_reality() {
     read_reality_list || return 1
     [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增"; return 1; }
-    read -p "输入新的 VLESS Reality 端口(留空随机 10000-60000): " new_port
-    new_port="${new_port:-$(rand_port)}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 VLESS Reality 端口" "$(rand_port_available)")" || return 1
+    assert_valid_sni "$REALITY_SNI" || return 1
     next_index=$(jq -r '[.inbounds[]? | select(.type=="vless" and .tls.reality.enabled==true and (.tag|test("^vless-in-[0-9]+$"))) | (.tag | split("-") | last | tonumber)] | max // 0' "$CONFIG_PATH")
     next_index=$((next_index + 1))
     new_tag="vless-in-$next_index"
     new_uuid="$(rand_uuid)"
     new_sid="$(rand_sid)"
     backup_config
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sid "$new_sid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" '{type:"vless",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sid "$new_sid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" '{type:"vless",tag:$tag,listen:"0.0.0.0",listen_port:$port,users:[{uuid:$uuid}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_REALITY true
     validate_and_restart
@@ -2039,9 +2384,7 @@ action_reset_reality() {
     [ "$idx" -ge 0 ] && [ "$idx" -lt "$REALITY_COUNT" ] || { err "编号超出范围"; return 1; }
     target_tag="${REALITY_TAGS[$idx]}"
     current_port="${REALITY_PORTS[$idx]}"
-    read -p "输入新的端口(回车保持 $current_port): " new_port
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 VLESS Reality 端口" "$current_port" "$target_tag")" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag == $tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -2052,9 +2395,7 @@ action_reset_anytls() {
     [ "$ANYTLS_COUNT" -gt 0 ] || { err "AnyTLS Reality 协议未启用"; return 1; }
     target_tag=$(select_tag_from_list "当前 AnyTLS 列表：" "${ANYTLS_TAGS[@]}") || return 1
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    read -p "输入新的 AnyTLS Reality 端口(回车保持 ${current_port}): " new_port
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_port="$(prompt_port "输入新的 AnyTLS Reality 端口" "$current_port" "$target_tag")" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" '.inbounds |= map(if .tag==$tag then .listen_port = $port else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -2067,13 +2408,13 @@ action_reset_socks() {
     current_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
     current_user=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .users[0].username // empty' "$CONFIG_PATH" | head -n1)
     current_pass=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag==$tag) | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
-    read -p "输入新的 SOCKS5 端口(回车保持 ${current_port}): " new_port
+    new_port="$(prompt_port "输入新的 SOCKS5 端口" "$current_port" "$target_tag")" || return 1
     read -p "输入新的 SOCKS5 用户名(回车保持 ${current_user}): " new_user
     read -p "输入新的 SOCKS5 密码(回车保持当前): " new_pass
-    new_port="${new_port:-$current_port}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
-    new_user="${new_user:-$current_user}"
-    new_pass="${new_pass:-$current_pass}"
+    new_user="$(trim_spaces "${new_user:-$current_user}")"
+    new_pass="$(trim_spaces "${new_pass:-$current_pass}")"
+    assert_non_empty "$new_user" "SOCKS5 用户名" || return 1
+    assert_non_empty "$new_pass" "SOCKS5 密码" || return 1
     backup_config
     jq --arg tag "$target_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '.inbounds |= map(if .tag==$tag then .listen_port = $port | .users[0].username = $user | .users[0].password = $pass else . end)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     validate_and_restart
@@ -2081,15 +2422,15 @@ action_reset_socks() {
 
 action_add_socks() {
     read_config || return 1
-    read -p "输入 SOCKS5 端口(留空随机 10000-60000): " new_port
+    new_port="$(prompt_port "输入 SOCKS5 端口" "$(rand_port_available)")" || return 1
     read -p "输入 SOCKS5 用户名(留空自动生成): " new_user
     read -p "输入 SOCKS5 密码(留空自动生成): " new_pass
-    new_port="${new_port:-$(rand_port)}"
-    new_user="${new_user:-socks$(rand_hex 2)}"
-    new_pass="${new_pass:-$(rand_pass)}"
-    ensure_valid_port "$new_port" || { err "端口必须是 1-65535 的数字"; return 1; }
+    new_user="$(trim_spaces "${new_user:-socks$(openssl rand -hex 2)}")"
+    new_pass="$(trim_spaces "${new_pass:-$(rand_pass)}")"
+    assert_non_empty "$new_user" "SOCKS5 用户名" || return 1
+    assert_non_empty "$new_pass" "SOCKS5 密码" || return 1
     new_tag=$(next_protocol_tag "socks-in")
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '{type:"socks",tag:$tag,listen:"::",listen_port:$port,users:[{username:$user,password:$pass}]}' )
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg pass "$new_pass" '{type:"socks",tag:$tag,listen:"0.0.0.0",listen_port:$port,users:[{username:$user,password:$pass}]}' )
     backup_config
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_SOCKS true
@@ -2111,18 +2452,20 @@ action_delete_socks() {
 
 action_add_anytls() {
     read_config || return 1
-    read -p "输入 AnyTLS 端口(留空随机 10000-60000): " new_port
+    new_port="$(prompt_port "输入 AnyTLS 端口" "$(rand_port_available)")" || return 1
     read -p "输入 AnyTLS 用户名(默认 anytls): " new_user
     read -p "输入 AnyTLS 密码(留空自动生成): " new_psk
-    new_port="${new_port:-$(rand_port)}"
-    new_user="${new_user:-anytls}"
-    new_psk="${new_psk:-$(rand_pass)}"
+    new_user="$(trim_spaces "${new_user:-anytls}")"
+    new_psk="$(trim_spaces "${new_psk:-$(rand_pass)}")"
+    assert_non_empty "$new_user" "AnyTLS 用户名" || return 1
+    assert_non_empty "$new_psk" "AnyTLS 密码" || return 1
+    assert_valid_sni "$REALITY_SNI" || return 1
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
     [ -n "${REALITY_PK:-}" ] || { err "未读取到 Reality private_key，无法新增 AnyTLS"; return 1; }
     new_sid="$(rand_sid)"
     new_tag=$(next_protocol_tag "anytls-in")
     backup_config
-    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg psk "$new_psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$new_sid" '{type:"anytls",tag:$tag,listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+    inbound=$(jq -nc --arg tag "$new_tag" --argjson port "$new_port" --arg user "$new_user" --arg psk "$new_psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$new_sid" '{type:"anytls",tag:$tag,listen:"0.0.0.0",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
     jq_add_inbound "$inbound"
     set_protocol_flag ENABLE_ANYTLS true
     validate_and_restart
@@ -2141,13 +2484,30 @@ action_delete_anytls() {
     validate_and_restart
 }
 
+run_remote_install_script_ipv4() {
+    local tmp_script
+    tmp_script="$(mktemp /tmp/singbox-install.XXXXXX.sh)" || { err "创建临时安装脚本失败"; return 1; }
+    if ! curl ${CURL_IPV4_OPTS} ${CURL_RETRY_OPTS} -fsSL https://sing-box.app/install.sh -o "$tmp_script"; then
+        rm -f "$tmp_script"
+        err "下载 sing-box 安装脚本失败"
+        return 1
+    fi
+    sed -i 's/curl /curl -4 /g; s/wget /wget -4 /g; s/apt-get /apt-get -o Acquire::ForceIPv4=true /g; s/apt /apt -o Acquire::ForceIPv4=true /g' "$tmp_script" || true
+    chmod +x "$tmp_script"
+    bash "$tmp_script"
+    local rc=$?
+    rm -f "$tmp_script"
+    return $rc
+}
+
 action_update() {
     info "开始更新 sing-box..."
-    ensure_fetcher || return 1
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(fetch "https://sing-box.app/install.sh")
+        apk update && apk upgrade sing-box || run_remote_install_script_ipv4
+    elif [ "$OS" = "debian" ]; then
+        apt-get ${APT_IPV4_OPTS} update && apt-get ${APT_IPV4_OPTS} install --only-upgrade -y sing-box || run_remote_install_script_ipv4
     else
-        bash <(fetch "https://sing-box.app/install.sh")
+        run_remote_install_script_ipv4
     fi
     info "更新完成,已重启服务..."
     if command -v sing-box >/dev/null 2>&1; then NEW_VER=$(sing-box version 2>/dev/null | head -n1); info "当前版本: $NEW_VER"; service_restart || warn "重启失败"; fi
@@ -2166,34 +2526,40 @@ action_show_relay_status() {
         echo "当前为直连模式，没有启用上游 SS 中转"
     fi
     echo
-    read -r -p "按回车返回菜单..." _
 }
 
 action_configure_relay_upstream() {
     read_config || return 1
     echo ""
-    echo "请输入上游 SS 服务器地址(当前: ${UPSTREAM_SS_SERVER:-未设置}):"
-    read -r new_server
-    new_server="${new_server:-${UPSTREAM_SS_SERVER:-}}"
-    new_server="$(echo "$new_server" | tr -d '[:space:]')"
-    [ -n "$new_server" ] || { err "上游 SS 地址不能为空"; return 1; }
+    echo "请输入上游 SS 链接(ss://...)，或直接输入服务器地址(当前: ${UPSTREAM_SS_SERVER:-未设置}):"
+    read -r new_server_input
+    new_server_input="${new_server_input:-${UPSTREAM_SS_SERVER:-}}"
+    new_server_input="$(trim_spaces "$new_server_input")"
 
-    echo "请输入上游 SS 端口(当前: ${UPSTREAM_SS_PORT:-未设置}):"
-    read -r new_port
-    new_port="${new_port:-${UPSTREAM_SS_PORT:-}}"
-    new_port="$(echo "$new_port" | tr -d '[:space:]')"
-    echo "$new_port" | grep -Eq '^[0-9]+$' || { err "上游 SS 端口必须是数字"; return 1; }
+    if [[ "$new_server_input" == ss://* ]]; then
+        parse_ss_uri "$new_server_input" || return 1
+        new_server="$PARSED_SS_SERVER"
+        new_port="$PARSED_SS_PORT"
+        new_method="$PARSED_SS_METHOD"
+        new_password="$PARSED_SS_PASSWORD"
+        info "已自动识别上游 SS 链接: ${new_server}:${new_port} | ${new_method}"
+    else
+        new_server="$new_server_input"
+        [ -n "$new_server" ] || { err "上游 SS 地址不能为空"; return 1; }
 
-    echo "请输入上游 SS 加密方式(当前: ${UPSTREAM_SS_METHOD:-未设置}):"
-    read -r new_method
-    new_method="${new_method:-${UPSTREAM_SS_METHOD:-}}"
-    new_method="$(echo "$new_method" | tr -d '[:space:]')"
-    [ -n "$new_method" ] || { err "上游 SS 加密方式不能为空"; return 1; }
+        new_port="$(prompt_port "请输入上游 SS 端口" "${UPSTREAM_SS_PORT:-}")" || return 1
 
-    echo "请输入上游 SS 密码(留空保持当前):"
-    read -r new_password
-    new_password="${new_password:-${UPSTREAM_SS_PASSWORD:-}}"
-    [ -n "$new_password" ] || { err "上游 SS 密码不能为空"; return 1; }
+        echo "请输入上游 SS 加密方式(当前: ${UPSTREAM_SS_METHOD:-未设置}):"
+        read -r new_method
+        new_method="${new_method:-${UPSTREAM_SS_METHOD:-}}"
+        new_method="$(trim_spaces "$new_method")"
+        [ -n "$new_method" ] || { err "上游 SS 加密方式不能为空"; return 1; }
+
+        echo "请输入上游 SS 密码(留空保持当前):"
+        read -r new_password
+        new_password="${new_password:-${UPSTREAM_SS_PASSWORD:-}}"
+        [ -n "$new_password" ] || { err "上游 SS 密码不能为空"; return 1; }
+    fi
 
     if [ ! -f "$CACHE_FILE" ]; then
         touch "$CACHE_FILE"
@@ -2309,7 +2675,16 @@ action_disable_relay_mode() {
 action_uninstall() {
     info "正在卸载 sing-box..."
     service_stop || true
-    if [ "$OS" = "alpine" ]; then apk del sing-box || true; rm -f /etc/init.d/sing-box; else systemctl disable sing-box || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload || true; fi
+    if [ "$SERVICE_BACKEND" = "openrc" ]; then
+        apk del sing-box || true
+        rm -f /etc/init.d/sing-box
+    elif [ "$SERVICE_BACKEND" = "systemd" ]; then
+        systemctl disable sing-box || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload || true
+    else
+        rm -f "$SB_PID_FILE"
+    fi
     rm -rf /etc/sing-box
     rm -f /usr/local/bin/sb
     info "卸载完成"
@@ -2341,7 +2716,7 @@ menu_links_and_config() {
         read -p "请输入选项: " subopt
         case "$subopt" in
             1) action_view_uri ;;
-            2) action_regenerate_uri ;;
+            2) generate_uris && cat "$URI_FILE" ;;
             3) action_view_config ;;
             4) action_edit_config ;;
             0) return 0 ;;
@@ -2531,7 +2906,7 @@ menu_service() {
         echo "------------------------------------"
         read -p "请输入选项: " subopt
         case "$subopt" in
-            1) service_status_pause ;;
+            1) service_status ;;
             2) action_update ;;
             3) action_uninstall ;;
             0) return 0 ;;
