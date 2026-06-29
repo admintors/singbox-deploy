@@ -122,14 +122,14 @@ assert_valid_sni() {
 url_decode() {
     local data="$1"
     data="${data//+/ }"
-    printf '%b' "${data//%/\x}"
+    printf '%b' "${data//%/\\x}"
 }
 
 decode_base64_compat() {
     local data="$1"
     local mod padded
     data="${data//-/+}"
-    data="${data//_//}"
+    data="${data//_/\/}"
     mod=$(( ${#data} % 4 ))
     padded="$data"
     if [ "$mod" -eq 2 ]; then
@@ -1573,14 +1573,14 @@ assert_valid_sni() {
 url_decode() {
     local data="$1"
     data="${data//+/ }"
-    printf '%b' "${data//%/\x}"
+    printf '%b' "${data//%/\\x}"
 }
 
 decode_base64_compat() {
     local data="$1"
     local mod padded
     data="${data//-/+}"
-    data="${data//_//}"
+    data="${data//_/\/}"
     mod=$(( ${#data} % 4 ))
     padded="$data"
     if [ "$mod" -eq 2 ]; then
